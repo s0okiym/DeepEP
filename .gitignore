@@ -26,3 +26,6 @@ coredump/
 # OpenCode
 .sisyphus/
 AGENTS.md
+
+# Local NCCL source mirror
+.nccl/
