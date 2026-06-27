@@ -1,0 +1,559 @@
+# DeepEP 技术解析：MoE 专家并行通信库
+
+> 文档版本：基于 DeepEP V2（`ElasticBuffer` + NCCL Gin backend）。
+> 阅读对象：希望理解 DeepEP 设计目标、完成的具体工作，以及 `dispatch` / `combine` 内部机制的工程师。
+
+---
+
+## 1. 概述：DeepEP 是什么，完成了哪些事
+
+### 1.1 定位
+
+**DeepEP（DeepEveryParallel）** 是一个面向现代大模型训练与推理的高性能 GPU 通信库。它的核心聚焦点是 **专家并行（Expert Parallelism, EP）**，即为 Mixture-of-Experts（MoE）模型提供高吞吐、低延迟的 all-to-all 通信原语，业内通常称之为 **MoE dispatch / combine**。除此之外，DeepEP 还提供实验性的流水线并行（PP）、上下文并行（CP）以及远程内存访问（Engram）能力。
+
+### 1.2 与通用集合通信库的区别
+
+| 维度 | NCCL / MPI 传统 all-to-all | DeepEP |
+|---|---|---|
+| 语义 |  rank 到 rank 的均匀数据交换 | token 到 expert 的“不规则”路由 |
+| 数据类型 | 通常 FP16/BF16 | 支持 BF16、FP8，可携带 top-k index / weight / scale factor |
+| 拓扑感知 | 较弱 | 显式区分 scale-up（NVLink）与 scale-out（RDMA）域 |
+| 计算耦合 | 纯通信 | 与 MoE  gate 决策、GEMM 输入布局深度耦合 |
+| 资源占用 | 通常占用大量 SM | V2 通过 NCCL Gin 与 TMA 极致压缩 SM 占用 |
+
+### 1.3 V2 完成的具体工作
+
+1. **统一 API**：高吞吐与低延迟路径统一为单个 `ElasticBuffer`，对外暴露 `dispatch` 与 `combine` 两个核心函数。
+2. **NCCL Gin backend**：基于 NCCL 的 header-only、轻量化设备端通信后端，可直接复用已有 NCCL communicator。
+3. **全 JIT 编译**：所有性能关键 kernel 在运行时编译，安装包无需预编译 CUDA，默认目标 SM90（Hopper）。
+4. **拓扑自适应**：自动识别 NVLink / RDMA 物理域，并映射为 scale-up / scale-out 逻辑域；单节点走 NVLink，多节点走 RDMA + NVLink 混合（hybrid mode）。
+5. **解析式调参**：SM 数量与 QP 数量通过带宽模型直接计算，不再需要离线 auto-tuning。
+6. **通信-计算重叠**：通过独立的通信流、`EventOverlap`、CUDA programmatic launch dependency 等机制，使 dispatch/combine 可与 GEMM/Attention 重叠。
+7. **低精度支持**：dispatch 路径支持 FP8（带 scale factors），combine 路径支持 BF16。
+8. **实验性功能**：0-SM Engram（RDMA 远程 KV fetch）、0-SM PP、AGRS（all-gather reduce-scatter）。
+
+---
+
+## 2. 背景知识与核心概念
+
+### 2.1 MoE 中的 dispatch 与 combine
+
+在 MoE 层中，每个 token 会通过 gate 网络选出 $k$ 个专家（top-$k$）。当模型采用 EP 时，专家被切分到不同 GPU / 节点上，因此：
+
+- **dispatch**：把当前 rank 上形状为 `[num_tokens, hidden]` 的激活，按照 top-k 决策，发送到承载目标专家的 rank 上。每个 token 可能被复制成 $k$ 份。
+- **combine**：各 rank 完成本地专家计算后，再把结果按原路“归还”到 token 来源 rank，并按 top-k weight 做加权求和。
+
+数学上，若第 $t$ 个 token 的 top-k 专家为 $\{e_{t,1},\dots,e_{t,k}\}$，权重为 $\{w_{t,1},\dots,w_{t,k}\}$，则：
+
+```
+dispatch:  x_t  ->  {x_{t,j} 送往 rank(e_{t,j})}
+combine:   对每一 t,  sum_{j=1..k} w_{t,j} * f_{e_{t,j}}(x_{t,j})
+```
+
+### 2.2 Scale-up 与 Scale-out
+
+- **Scale-up domain**：同一节点内通过 NVLink 互联的 GPU 集合。带宽高（数百 GB/s）、延迟低、支持 GPU 直接 load/store（P2P / symmetric memory）。
+- **Scale-out domain**：跨节点通过 RDMA（InfiniBand / RoCE）互联。带宽低（数十 GB/s）、延迟高，依赖 NIC 的 Queue Pair（QP）进行 RDMA PUT/GET。
+
+DeepEP 把物理拓扑抽象为两层逻辑域：
+
+- `num_scaleout_ranks`：节点数（RDMA 域大小）。
+- `num_scaleup_ranks`：每节点 GPU 数（NVLink 域大小）。
+- 总 rank 数 `num_ranks = num_scaleout_ranks * num_scaleup_ranks`。
+
+### 2.3 NCCL Gin backend
+
+NCCL Gin 是 NCCL 提供的“轻量设备端通信”接口，核心特征：
+
+- 通过 `ncclGin` 句柄在 CUDA kernel 内直接发起 RDMA / NVLink 操作，无需经过 host CPU。
+- 支持 `put`、`put_value`、`red_add`、`signal`/`wait` 等原语。
+- 通过 `team_t`（`ncclTeamTagWorld`、`ncclTeamTagLsa`、`ncclTeamTagRail`）区分通信组。
+- 多个 warp / SM 共享 QP（Queue Pair），通过 `ncclGinResourceSharingMode` 控制并发。
+
+### 2.4 Hopper 关键硬件特性
+
+DeepEP V2 充分利用 Hopper（SM90）特性：
+
+- **TMA（Tensor Memory Accelerator）**：异步一维/多维拷贝，warp 只需提交描述符，由硬件单元完成数据搬运。
+- **mbarrier**：异步内存屏障，协调 TMA load/store 的到达与完成。
+- **Programmatic Launch Dependency（PDL）**：`cudaTriggerProgrammaticLaunchCompletion` 让一个 kernel 的完成成为下一个 kernel 的启动依赖，无需 CPU 介入。
+- **LDG / STG 与 PTX 优化**：大量使用 inline PTX 控制缓存行为（`.nc`、`.L1::no_allocate` 等）。
+
+---
+
+## 3. 整体架构
+
+### 3.1 内存与 buffer 布局
+
+一个 `ElasticBuffer` 实例对应一块 **NCCL symmetric memory**，地址在集群所有 rank 上对称。其布局为：
+
+```text
+[Workspace | GPU buffer | CPU buffer]
+```
+
+- **Workspace**：用于 barrier 信号、计数器、prefix sum、channel tail 等元数据。
+- **GPU buffer**：dispatch / combine 的收发缓存。
+- **CPU buffer**：Engram 等实验功能使用。
+
+每个 token 在 buffer 中按 `TokenLayout` 存储，包含：
+
+```text
+[hidden data] [scale factors] [top-k indices] [top-k weights] [src token global idx] [linked list idx] [mbarrier]
+```
+
+`BufferLayout` 则按 `[num_ranks, num_max_tokens_per_rank]` 组织这些 token slot。
+
+### 3.2 三种核心 warp 角色
+
+| 角色 | 职责 | 出现位置 |
+|---|---|---|
+| **Notify warps** | 统计每个 rank / expert 将接收多少 token；做跨 rank 计数同步；生成 prefix sum | dispatch / hybrid dispatch |
+| **Dispatch / Scale-up / Scale-out warps** | 实际搬移 token：TMA load 本地数据，TMA store / RDMA PUT 到目标 rank | dispatch、hybrid dispatch |
+| **Forward warps** | 在多节点 hybrid 模式下，把跨 RDMA 域收到的 token 再 forward 到本节点内的目标 GPU | hybrid dispatch / hybrid combine |
+
+### 3.3 通信域抽象
+
+```mermaid
+flowchart TB
+    subgraph ScaleOut["Scale-out Domain (RDMA)"]
+        direction LR
+        subgraph Node0["Node 0"]
+            subgraph ScaleUp0["Scale-up Domain (NVLink)"]
+                G0["GPU 0"] --- G1["GPU 1"]
+            end
+        end
+        subgraph Node1["Node 1"]
+            subgraph ScaleUp1["Scale-up Domain (NVLink)"]
+                G2["GPU 2"] --- G3["GPU 3"]
+            end
+        end
+    end
+    G0 -. "RDMA QP" .-> G2
+    G1 -. "RDMA QP" .-> G3
+```
+
+---
+
+## 4. Dispatch 详细流程
+
+### 4.1 功能与输入输出
+
+`ElasticBuffer.dispatch` 的语义：把当前 rank 的输入 token 按照 `topk_idx` / `topk_weights` 路由到所有 rank 上对应 expert 的接收区。
+
+**输入**：
+
+- `x`: `[num_tokens, hidden]`，BF16；或 FP8 tuple `(data, scale_factors)`。
+- `topk_idx`: `[num_tokens, num_topk]`，每个 token 选中的全局 expert 索引。
+- `topk_weights`: `[num_tokens, num_topk]`，可选。
+- `num_experts`, `num_max_tokens_per_rank`, `expert_alignment`。
+
+**输出**：
+
+- `recv_x`: 本 rank 从所有 rank 收到的 token 数据。
+- `recv_topk_idx` / `recv_topk_weights`：收到 token 对应的本地 expert 索引与权重。
+- `handle` (`EPHandle`)：供后续 `combine` 使用，包含路由元数据。
+- `event`：用于通信-计算同步。
+
+### 4.2 单节点（scale-up only）dispatch 流程
+
+当 `num_scaleout_ranks == 1` 时，只存在 NVLink（或纯 RDMA 同域）通信。
+
+```mermaid
+flowchart TD
+    A["输入: x, topk_idx, topk_weights"] --> B["Notify warps 统计<br/>rank_count / expert_count"]
+    B --> C["跨 SM red_add 计数到 workspace"]
+    C --> D["SM0 汇总并写入 peers<br/>scaleup_rank_count / scaleup_expert_count"]
+    D --> E["等待所有 peers 计数到达"]
+    E --> F["计算 prefix sum<br/>psum_num_recv_tokens_per_scaleup_rank<br/>psum_num_recv_tokens_per_expert"]
+    F --> G["Dispatch warps 遍历每个 token"]
+    G --> H["TMA load token 到 smem"]
+    H --> I["解析 top-k 目标 rank / expert"]
+    I --> J{"dst_rank 是否本地?"}
+    J -- 是 --> K["TMA store 到本地 recv buffer"]
+    J -- 否, NVLink --> L["TMA store 到远程对称地址"]
+    J -- 否, RDMA --> M["先写入 send buffer, 再 RDMA PUT"]
+    K --> N["grid barrier 等待数据到达"]
+    L --> N
+    M --> N
+    N --> O["Copy epilogue 把 buffer 数据搬出到 recv_x"]
+    O --> P["返回 recv_x, recv_topk_*, handle, event"]
+```
+
+#### 4.2.1 Notify 阶段
+
+1. 每个 SM 分配若干 notify warps（默认 4 个 warp = 128 线程）。
+2. 在共享内存中维护 `rank_count[0..num_ranks-1]` 与 `expert_count[0..num_experts-1]`。
+3. 每个 warp 按 `global_warp_idx` 步长遍历所有 token：
+   - lane $j$ 读取 `topk_idx[token, j]`。
+   - 对 expert 做原子加 `atomicAdd_block(expert_count + dst_expert_idx, 1)`。
+   - 对 rank 做去重后原子加：同一条 token 的多个 top-k 可能落在同一 rank，只计一次。
+4. 所有 SM 通过 `ptx::red_add` 把本 SM 的计数 reduce 到 workspace 的 64-bit 计数器（高 32 bit 记录到达 SM 数，低 32 bit 记录计数值）。
+5. SM0 检测到所有 SM 到达后，把计数编码（`encode_decode_positive`）写入 send buffer，通过 NCCL Gin `put_value` / `put` 发送到所有 peer rank。
+6. 等待 peer 计数到达后，计算每个本地 expert 的接收 token 数，并按 `expert_alignment` 对齐；再计算两个 prefix sum：
+   - `psum_num_recv_tokens_per_scaleup_rank`（inclusive）：用于知道来自每个 scale-up rank 的 token 在本 rank buffer 中的位置。
+   - `psum_num_recv_tokens_per_expert`（exclusive）：用于 expand 模式下的 atomic scatter。
+
+#### 4.2.2 Dispatch 阶段
+
+1. 每个 SM 的剩余 warp 作为 dispatch warps。每个 warp 是一个 **channel**。
+2. 通过 `comm::get_qp_mode` 把 `(sm_idx, warp_idx)` 映射到 QP 与 sharing mode。
+3. 每个 channel 按 `token_start = dispatch_warp_idx * num_sms + sm_idx` 遍历 token，步长 `num_dispatch_warps * num_sms`。
+4. 对每一个 token：
+   - 用 TMA 把 hidden data + scale factors 异步加载到 smem。
+   - lane 读取 `topk_idx`，写入 smem 的 metadata 区。
+   - 把源 token 的全局索引 `rank_idx * num_max_tokens_per_rank + token_idx` 写入 metadata。
+   - 去重目标 rank，为每个目标 rank 在对应的原子计数器上分配一个 slot（`dst_buffer_slot_idx`）。
+   - 等待 TMA load 到达后，用 TMA store 把完整 token 写到：
+     - 本地 recv buffer（如果目标 rank 是自己）。
+     - 远程 rank 的对称地址（NVLink 可达）。
+     - 或者先写到 send buffer，再发起 RDMA PUT（跨节点）。
+
+#### 4.2.3 Barrier 与 Copy Epilogue
+
+1. dispatch kernel 结束前调用 `comm::gpu_barrier`，确保所有 rank 的 buffer 数据可见。
+2. 通过 `cudaTriggerProgrammaticLaunchCompletion` 触发 PDL，启动 **dispatch_copy_epilogue** kernel。
+3. Copy epilogue 把对称 buffer 中的 token 逐个读回，按目标 expert 索引 scatter 到 `recv_x`：
+   - 非 expand 模式：按收到顺序直接写入 `recv_x[i]`。
+   - expand 模式：按 expert 做 atomicAdd 到 `psum_num_recv_tokens_per_expert`，把同一 expert 的 token 紧凑排列，便于后续 GEMM。
+4. 同时生成 `recv_src_metadata[i, 0..num_topk+1]`，记录源 token 全局索引、源 rank 与 master top-k lane，供 combine 反向路由。
+
+### 4.3 多节点 hybrid dispatch 流程
+
+当 `num_scaleout_ranks > 1` 时，DeepEP 采用 **两跳路由**：
+
+1. **Scale-out 阶段**：把 token 从源节点经 RDMA 发送到目标 scale-out rank 的 scale-out recv buffer。
+2. **Forward 阶段**：在目标节点内部，把 token 从 scale-out recv buffer 经 NVLink forward 到最终承载 expert 的 scale-up rank 的 scale-up buffer。
+
+```mermaid
+flowchart LR
+    subgraph SrcNode["源节点"]
+        SGPU["GPU src"]
+    end
+    subgraph DstNode["目标 scale-out 节点"]
+        direction TB
+        DGPU0["GPU 0 (forward warp)"]
+        DGPU1["GPU 1 (目标 expert)"]
+    end
+    SGPU -->|"RDMA PUT<br/>scale-out send buffer -> scale-out recv buffer"| DGPU0
+    DGPU0 -->|"NVLink TMA store<br/>scale-up buffer"| DGPU1
+```
+
+#### 4.3.1 Notify 在 hybrid 模式下的变化
+
+- 需要先统计跨 scale-out rank 的 token 数量。
+- 每个 scale-out rank 内再统计跨 scale-up rank 的数量。
+- 通过 `ncclTeamTagRail` 在 scale-out 域内交换计数，通过 `ncclTeamTagLsa` 在 scale-up 域内交换计数。
+- 使用 `red_add_rel` 做跨节点的原子 reduce，最终得到每个本地 expert 的接收数。
+
+#### 4.3.2 Scale-out warps
+
+- 每个 warp/channel 负责把 token 经 RDMA 发到目标 scale-out rank。
+- 在 send buffer 中为 token 预留位置；如果目标 scale-out 就是本节点，直接写入本地 scale-out recv buffer（bypass）。
+- 通过 `update_scaleout_tail` 周期性向目标节点的 forward warps 发送 tail 信号，通知“新到多少 token”。
+
+#### 4.3.3 Forward warps
+
+- 每个 channel 轮询所有 scale-out peer 的 `scaleout_channel_signaled_tail`。
+- 发现有新 token 后，TMA load 到 smem，解析 top-k 得到目标 scale-up rank。
+- 为每个目标 scale-up rank 在 scale-up buffer 中分配 slot，并记录 `token_metadata_at_forward`。
+- 通过 `channel_linked_list` 把同一 scale-up peer 的 token 连成链表，供 combine 阶段直接遍历。
+
+---
+
+## 5. Combine 详细流程
+
+### 5.1 功能与输入输出
+
+`ElasticBuffer.combine` 的语义：把各 rank 上专家计算后的结果，按 dispatch 记录的反向路由，归约回每个源 token 所在 rank，并按 top-k weight 加权。
+
+**输入**：
+
+- `x`: `[num_tokens, hidden]`，BF16，通常是专家计算后的输出。
+- `handle`: dispatch 返回的 `EPHandle`，包含 `src_metadata`、`topk_idx` 等。
+- `topk_weights`: `[num_tokens, num_topk]`，可选；非 expand 模式下用于最终加权。
+- `bias_0` / `bias_1`: 可选输出 bias。
+
+**输出**：
+
+- `combined_x`: `[num_combined_tokens, hidden]`，归约后的输出。
+- `combined_topk_weights`: 可选，用于 backward。
+- `event`：同步事件。
+
+### 5.2 单节点 combine 流程
+
+```mermaid
+flowchart TD
+    A["输入: x, handle"] --> B["grid barrier 确保远程 buffer 可用"]
+    B --> C["Combine warps 遍历 num_reduced_tokens"]
+    C --> D["读取 src_metadata<br/>src_token_idx, src_rank_idx, src_topk_idx"]
+    D --> E{"src_rank 是否本地 NVLink?"}
+    E -- 是 --> F["直接从远程对称地址 TMA load"]
+    E -- 否 --> G["从本地 RDMA send buffer TMA load"]
+    F --> H{"expand + 多选?"}
+    G --> H
+    H -- 无需 reduce --> I["TMA store 到 master_token_buffer"]
+    H -- 需要 reduce --> J["在 smem 中按 top-k slot 累加"]
+    J --> K["TMA store 累加结果"]
+    H -- expand + send all --> L["每个 top-k 分别发一份"]
+    I --> M["grid barrier 等待数据到达"]
+    K --> M
+    L --> M
+    M --> N["Reduce epilogue 读 buffer, 按 top-k weight 求和, 写 combined_x"]
+    N --> O["返回 combined_x, event"]
+```
+
+#### 5.2.1 Main combine kernel
+
+1. 每个 warp/channel 遍历 `num_reduced_tokens`（即 dispatch 阶段本 rank 收到的 token 数）。
+2. 对第 $i$ 个 token，从 `src_metadata[i]` 解析：
+   - `src_token_global_idx`：源 token 在全局 batch 中的索引。
+   - `src_rank_topk_idx = src_rank_idx * num_topk + src_topk_idx`：标识源 rank 与 top-k 位置。
+3. 判断源 rank 是否 NVLink 可达：
+   - 可达：直接 `get_sym_ptr` 拿到远程对称地址，从该地址 TMA load。
+   - 不可达：从本地 send buffer 的对应位置读取（数据已由远端 RDMA PUT 写入）。
+4. 三种处理路径：
+   - **非 expand 且无需 reduce**：直接把数据写到 `master_token_buffer`。
+   - **expand 且 allow_multiple_reduction**：在共享内存中把同一源 token 的多个 top-k 结果累加，再写回。
+   - **expand 且禁用多轮 reduce**：把每个 top-k 结果分别发回源 rank 的不同 slot。
+5. 若提供 `topk_weights`，把权重写入 token buffer 的 metadata 区，供 reduce epilogue 使用。
+6. 对 RDMA 路径，等待 TMA store 完成后发起 `gin.put`。
+7. 结束 barrier 等待所有数据到达。
+
+#### 5.2.2 Reduce epilogue
+
+`combine_reduce_epilogue` kernel 通过 PDL 在 main combine kernel 完成后启动：
+
+1. 对每个输出 token `t`（`0..num_combined_tokens-1`），读取 `combined_topk_idx[t]` 得到目标专家。
+2. 根据目标专家确定需要 reduce 的源 rank / slot（使用 `kUseRankLayout` 或 `kUseTopkLayout`）。
+3. 在 smem 中做向量化的 FP32/BF16 累加，同时可加入 `bias_0` / `bias_1`。
+4. 把结果 TMA store 到 `combined_x[t]`。
+5. 若需要，把对应的 `topk_weights` 写回 `combined_topk_weights`。
+
+### 5.3 多节点 hybrid combine 流程
+
+Combine 是 dispatch 的逆过程，同样分 scale-up 与 scale-out 两跳：
+
+1. **Scale-up warps**：读取 `channel_linked_list`，遍历本节点内各 scale-up rank 需要 reduce 的 token；在本地 scale-up buffer 中完成 reduce 后，把结果发到 scale-out send buffer。
+2. **Forward warps**：把 scale-out send buffer 中的 token 经 RDMA PUT 发回源 scale-out rank。
+3. 源 scale-out rank 的 scale-up warps 再把数据 forward 到最终目标 rank（如果需要）。
+
+```mermaid
+flowchart RL
+    subgraph DstNode["目标节点"]
+        direction TB
+        DGPU1["GPU 1 (scale-up warp)<br/>reduce in scale-up buffer"]
+        DGPU0["GPU 0 (forward warp)"]
+    end
+    subgraph SrcNode["源节点"]
+        SGPU["GPU src"]
+    end
+    DGPU1 -->|"NVLink TMA store<br/>scale-out send buffer"| DGPU0
+    DGPU0 -->|"RDMA PUT"| SGPU
+    SGPU -->|"NVLink / 本地 reduce<br/>得到 combined_x"| SGPU
+```
+
+---
+
+## 6. 关键机制深入
+
+### 6.1 EPHandle 与缓存
+
+`EPHandle` 保存了一次 dispatch 产生的全部元数据：
+
+- `topk_idx`：dispatch 时的专家选择（clone）。
+- `psum_num_recv_tokens_per_scaleup_rank`：来自各 scale-up rank 的 token 前缀和。
+- `psum_num_recv_tokens_per_expert`：本地各 expert 的 token 前缀和。
+- `recv_src_metadata`：每个收到 token 的源信息。
+- `dst_buffer_slot_idx`、`token_metadata_at_forward`、`channel_linked_list`：hybrid 模式专用。
+
+在推理解码阶段，如果 gate 决策不变，可直接把上一次的 `EPHandle` 传入下一次 `dispatch`，跳过 notify / prefix sum 等 CPU 同步，显著降低 latency。
+
+### 6.2 CPU sync 与无 CPU sync
+
+- **CPU sync（`do_cpu_sync=True`）**：dispatch kernel 把 rank/expert 计数写到 host-mapped workspace，CPU 轮询直到拿到精确接收数，再分配 `recv_x` 等输出 tensor。优点是输出尺寸精确；缺点是需要 CPU 等待 GPU，无法与 CUDA graph 一起使用。
+- **无 CPU sync**：直接按 `num_max_tokens_per_rank * num_ranks` 的最大值分配输出，copy epilogue 再根据 GPU 上的 prefix sum 实际填充。优点是可完全异步；缺点是 buffer 空间浪费。
+
+### 6.3 Deterministic prologue
+
+当 `deterministic=True` 且单节点时，DeepEP 会先启动一个独立的 `dispatch_deterministic_prologue` kernel：
+
+- 预先遍历所有 token 的 `topk_idx`。
+- 为每个 `(token, top-k)` 分配确定性的 `dst_buffer_slot_idx`。
+- 避免 dispatch 主 kernel 中跨 warp 的原子竞争，保证结果可复现。
+
+### 6.4 Expand mode
+
+- **非 expand**：每个 token 在 recv buffer 中保留 $k$ 个 slot，排列为 `[num_recv_tokens, num_topk]`。
+- **expand**：每个 `(token, expert)` 对占用独立一行，`recv_x` 形状为 `[num_expanded_tokens, hidden]`，同一 expert 的 token 在内存中连续，可直接作为专家 GEMM 的输入。
+
+Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现。
+
+### 6.5 Multiple reduction
+
+`allow_multiple_reduction` 控制 combine 中是否允许多次累加：
+
+- **启用**：在 main combine kernel 中尽可能先做局部 reduce，减少跨网络发送的数据量。
+- **禁用**：每个 top-k 结果单独发回源 rank，在最终的 reduce epilogue 中只做一次累加，精度更优但通信量更大。
+
+### 6.6 FP8 dispatch
+
+当 `use_fp8_dispatch=True` 时：
+
+- `x` 为 tuple `(data, scale_factors)`，`data` 类型 `torch.float8_e4m3fn`。
+- `TokenLayout` 额外预留 `num_sf_bytes` 存放 scale factors。
+- copy epilogue 支持 `use_tma_aligned_col_major_sf`，把 scale factors 排成列主序，便于后续 GEMM 直接消费。
+
+### 6.7 Barrier 设计
+
+`comm::gpu_barrier` 统一处理三类 barrier：
+
+- **NVLink barrier**：通过共享内存中的原子计数器与信号数组，单 SM 即可完成。
+- **Gin barrier**：对所有 QP flush 后，用 NCCL Gin `signal` / shadow counter 等待全部 peer 到达。
+- **Hybrid barrier**：SM0 负责 scale-up 子域 barrier，其余 SM 负责 scale-out 子域 barrier，通过 grid sync 协调。
+
+### 6.8 QP 与 channel 映射
+
+`comm::get_qp_mode` 根据 `num_sms`、`num_qps`、`num_channels_per_sm` 决定每个 channel 使用哪个 QP：
+
+- 若 `num_sms <= num_qps`：每个 SM 独占若干 QP，channel 在 SM 内轮询 QP。
+- 否则：所有 SM 共享 QP，按全局 channel 索引取模。
+- notify warps 固定使用 QP 0 与 `NCCL_GIN_RESOURCE_SHARING_CTA` 模式。
+
+---
+
+## 7. SM / QP 数量估算
+
+### 7.1 理论 SM 数
+
+`get_theoretical_num_sms` 基于带宽瓶颈模型：
+
+1. 根据 gate 分布计算期望的跨 scale-up / scale-out top-k 数量。
+2. 分别估算 HBM read、HBM write、RDMA traffic、NVLink traffic。
+3. 找出瓶颈链路，按 `bounded_gbs / bounded_traffic` 与 SM 读写能力计算所需 SM。
+4. 最终向上对齐到不小于 4 的偶数，并受 `prefer_overlap_with_compute` 影响。
+
+### 7.2 理论 QP 数
+
+- 单节点 direct 模式：`min(num_sms, 8) + 1`（含 notify QP）。
+- 多节点 hybrid 模式：`num_sms * 16 + 1`。
+- 最终不超过 `num_allocated_qps`（默认 direct 17，hybrid 65/129）。
+
+---
+
+## 8. 总结
+
+DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升为与模型拓扑、数据布局、硬件特性紧密集成的专家并行通信库：
+
+1. **统一 ElasticBuffer**：一套 API 覆盖高吞吐训练/预填与低延迟解码。
+2. **两层拓扑感知**：scale-up（NVLink）与 scale-out（RDMA）分层路由，hybrid 模式支持跨节点高效转发。
+3. **极致硬件利用**：TMA、mbarrier、PDL、inline PTX 把 SM 占用压到最低（V2 相比 V1 最多减少 4x SM）。
+4. **全 JIT + 解析式调参**：无需离线 tuning，安装简单。
+5. **丰富的精度与模式**：BF16 / FP8、expand / non-expand、multiple reduction、CPU sync / async、handle 缓存。
+
+理解 `dispatch` 与 `combine` 的关键，在于把握 **token 路由 -> 计数同步 -> 异步搬运 -> barrier -> epilogue 整理** 这一完整闭环，以及 DeepEP 如何在 NVLink 与 RDMA 两种物理介质上高效实现这一闭环。
+
+---
+
+## 附录 A：关键流程 mermaid 源码（双引号引用）
+
+> 本节把正文中的关键流程图以双引号包裹的 mermaid 源码形式再次列出，便于提取、复用或纳入其它文档系统。
+
+### A.1 通信域抽象
+
+```text
+"flowchart TB
+    subgraph ScaleOut[\"Scale-out Domain (RDMA)\"]
+        direction LR
+        subgraph Node0[\"Node 0\"]
+            subgraph ScaleUp0[\"Scale-up Domain (NVLink)\"]
+                G0[\"GPU 0\"] --- G1[\"GPU 1\"]
+            end
+        end
+        subgraph Node1[\"Node 1\"]
+            subgraph ScaleUp1[\"Scale-up Domain (NVLink)\"]
+                G2[\"GPU 2\"] --- G3[\"GPU 3\"]
+            end
+        end
+    end
+    G0 -. \"RDMA QP\" .-> G2
+    G1 -. \"RDMA QP\" .-> G3"
+```
+
+### A.2 单节点 dispatch 流程
+
+```text
+"flowchart TD
+    A[\"输入: x, topk_idx, topk_weights\"] --> B[\"Notify warps 统计<br/>rank_count / expert_count\"]
+    B --> C[\"跨 SM red_add 计数到 workspace\"]
+    C --> D[\"SM0 汇总并写入 peers<br/>scaleup_rank_count / scaleup_expert_count\"]
+    D --> E[\"等待所有 peers 计数到达\"]
+    E --> F[\"计算 prefix sum<br/>psum_num_recv_tokens_per_scaleup_rank<br/>psum_num_recv_tokens_per_expert\"]
+    F --> G[\"Dispatch warps 遍历每个 token\"]
+    G --> H[\"TMA load token 到 smem\"]
+    H --> I[\"解析 top-k 目标 rank / expert\"]
+    I --> J{\"dst_rank 是否本地?\"}
+    J -- 是 --> K[\"TMA store 到本地 recv buffer\"]
+    J -- 否, NVLink --> L[\"TMA store 到远程对称地址\"]
+    J -- 否, RDMA --> M[\"先写入 send buffer, 再 RDMA PUT\"]
+    K --> N[\"grid barrier 等待数据到达\"]
+    L --> N
+    M --> N
+    N --> O[\"Copy epilogue 把 buffer 数据搬出到 recv_x\"]
+    O --> P[\"返回 recv_x, recv_topk_*, handle, event\"]"
+```
+
+### A.3 多节点 hybrid dispatch 两跳路由
+
+```text
+"flowchart LR
+    subgraph SrcNode[\"源节点\"]
+        SGPU[\"GPU src\"]
+    end
+    subgraph DstNode[\"目标 scale-out 节点\"]
+        direction TB
+        DGPU0[\"GPU 0 (forward warp)\"]
+        DGPU1[\"GPU 1 (目标 expert)\"]
+    end
+    SGPU -->|\"RDMA PUT<br/>scale-out send buffer -> scale-out recv buffer\"| DGPU0
+    DGPU0 -->|\"NVLink TMA store<br/>scale-up buffer\"| DGPU1"
+```
+
+### A.4 单节点 combine 流程
+
+```text
+"flowchart TD
+    A[\"输入: x, handle\"] --> B[\"grid barrier 确保远程 buffer 可用\"]
+    B --> C[\"Combine warps 遍历 num_reduced_tokens\"]
+    C --> D[\"读取 src_metadata<br/>src_token_idx, src_rank_idx, src_topk_idx\"]
+    D --> E{\"src_rank 是否本地 NVLink?\"}
+    E -- 是 --> F[\"直接从远程对称地址 TMA load\"]
+    E -- 否 --> G[\"从本地 RDMA send buffer TMA load\"]
+    F --> H{\"expand + 多选?\"}
+    G --> H
+    H -- 无需 reduce --> I[\"TMA store 到 master_token_buffer\"]
+    H -- 需要 reduce --> J[\"在 smem 中按 top-k slot 累加\"]
+    J --> K[\"TMA store 累加结果\"]
+    H -- expand + send all --> L[\"每个 top-k 分别发一份\"]
+    I --> M[\"grid barrier 等待数据到达\"]
+    K --> M
+    L --> M
+    M --> N[\"Reduce epilogue 读 buffer, 按 top-k weight 求和, 写 combined_x\"]
+    N --> O[\"返回 combined_x, event\"]"
+```
+
+### A.5 多节点 hybrid combine 两跳路由
+
+```text
+"flowchart RL
+    subgraph DstNode[\"目标节点\"]
+        direction TB
+        DGPU1[\"GPU 1 (scale-up warp)<br/>reduce in scale-up buffer\"]
+        DGPU0[\"GPU 0 (forward warp)\"]
+    end
+    subgraph SrcNode[\"源节点\"]
+        SGPU[\"GPU src\"]
+    end
+    DGPU1 -->|\"NVLink TMA store<br/>scale-out send buffer\"| DGPU0
+    DGPU0 -->|\"RDMA PUT\"| SGPU
+    SGPU -->|\"NVLink / 本地 reduce<br/>得到 combined_x\"| SGPU"
+```
