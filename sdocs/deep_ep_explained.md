@@ -179,19 +179,162 @@ flowchart TD
     O --> P["返回 recv_x, recv_topk_*, handle, event"]
 ```
 
-#### 4.2.1 Notify 阶段
+#### 4.2.1 Notify 阶段：先做一次 all-to-all 的“数数”
 
-1. 每个 SM 分配若干 notify warps（默认 4 个 warp = 128 线程）。
-2. 在共享内存中维护 `rank_count[0..num_ranks-1]` 与 `expert_count[0..num_experts-1]`。
-3. 每个 warp 按 `global_warp_idx` 步长遍历所有 token：
-   - lane $j$ 读取 `topk_idx[token, j]`。
-   - 对 expert 做原子加 `atomicAdd_block(expert_count + dst_expert_idx, 1)`。
-   - 对 rank 做去重后原子加：同一条 token 的多个 top-k 可能落在同一 rank，只计一次。
-4. 所有 SM 通过 `ptx::red_add` 把本 SM 的计数 reduce 到 workspace 的 64-bit 计数器（高 32 bit 记录到达 SM 数，低 32 bit 记录计数值）。
-5. SM0 检测到所有 SM 到达后，把计数编码（`encode_decode_positive`）写入 send buffer，通过 NCCL Gin `put_value` / `put` 发送到所有 peer rank。
-6. 等待 peer 计数到达后，计算每个本地 expert 的接收 token 数，并按 `expert_alignment` 对齐；再计算两个 prefix sum：
-   - `psum_num_recv_tokens_per_scaleup_rank`（inclusive）：用于知道来自每个 scale-up rank 的 token 在本 rank buffer 中的位置。
-   - `psum_num_recv_tokens_per_expert`（exclusive）：用于 expand 模式下的 atomic scatter。
+Dispatch 真正的数据搬运之前，必须先完成 notify 阶段。它的核心任务是一次轻量的 all-to-all 元数据协商：每个 rank 告诉所有 peer “我会发给你多少 token”，同时收集 peer 会发给自己的数量。
+
+##### 4.2.1.1 为什么必须统计
+
+在 MoE EP 中，每个 token 的 top-k 选择是 **不规则且不可预测的**：
+
+- 当前 rank 知道本地每个 token 要去哪些 expert / 哪些 rank；
+- 但它不知道远程 rank 会把哪些 token 路由到自己这里；
+- 接收端必须预先知道：
+  1. 每个 peer rank 会发来多少 token → 分配接收 buffer、确定 slot 偏移；
+  2. 每个本地 expert 会收到多少 token → 决定专家计算输入形状、GEMM 启动参数；
+  3. 每个 `(token, top-k)` 该写到目标 rank 的哪个 slot → 保证发送端不互相覆盖，且 combine 能按原路返回。
+
+没有这些统计，后续 RDMA/NVLink 数据搬运就不知道“往哪写、写多少、写完后怎么组合回去”。
+
+##### 4.2.1.2 Notify 统计的数据结构
+
+在 `dispatch.cuh:78-252` 中，前 `kNumNotifyWarps` 个 warp 专职做统计。每个 SM 在共享内存中维护：
+
+```cpp
+// dispatch.cuh:85
+int *rank_count = rank_expert_count;                 // [0, num_ranks)
+int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+num_experts)
+```
+
+- `rank_count[dst_rank]`：当前 rank 要发给 `dst_rank` 的 **去重后** token 数。
+- `expert_count[dst_expert]`：当前 rank 要发给 `dst_expert` 的 token 数（不去重）。
+
+为什么要去重 `rank_count`？因为一个 token 的 top-2 可能都落在同一个 rank 上。对 **rank 级 buffer 槽位分配**，这个 token 只占用一个 slot；但 **专家级统计** 仍要分别计数，因为后续计算是两个 expert 各做一次。
+
+##### 4.2.1.3 统计流程
+
+1. **本 SM 局部计数**  
+   每个 notify warp 按 `global_warp_idx` 步长遍历所有 token，lane $j$ 读取 `topk_idx[token, j]`：
+
+   ```cpp
+   // dispatch.cuh:97-105
+   const auto dst_expert_idx = lane_idx < kNumTopk ?
+       static_cast<int>(__ldg(topk_idx + i * kNumTopk + lane_idx)) : -1;
+   if (dst_expert_idx >= 0)
+       atomicAdd_block(expert_count + dst_expert_idx, 1);
+
+   const auto dst_rank_idx = dst_expert_idx >= 0 ? dst_expert_idx / kNumExpertsPerRank : -1;
+   if (ptx::deduplicate(dst_rank_idx, lane_idx) and dst_rank_idx >= 0)
+       atomicAdd_block(rank_count + dst_rank_idx, 1);
+   ```
+
+2. **跨 SM 归约**  
+   所有 SM 通过 `ptx::red_add` 把计数 reduce 到 workspace 的 64-bit 计数器：
+
+   ```cpp
+   // dispatch.cuh:111-114
+   const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
+   ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
+   ```
+
+   高 32 bit 记录到达的 SM 数，低 32 bit 记录计数值。
+
+3. **SM0 汇总并 all-to-all 计数**  
+   当 `status >> 32 == kNumSMs` 时，SM0 把归约结果编码，分别用 `gin.put_value`（rank 计数）和 `gin.put`（expert 计数 bulk）写到所有 peer 的接收区：
+
+   ```cpp
+   // dispatch.cuh:151-177
+   for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+       const auto dst_rank_counter =
+           workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx;
+       gin.put_value<team_t>(dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
+                             ncclGinOptFlagsAggregateRequests);
+   }
+   ```
+
+4. **等待 peer 计数**  
+   SM0 自旋等待 `scaleup_rank_expert_count_ptr<false>()[i]`，直到拿到所有 peer 发给本 rank 的 per-rank / per-expert 计数：
+
+   ```cpp
+   // dispatch.cuh:184-200
+   const auto count = static_cast<int>(
+       ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + i));
+   ```
+
+5. **本地 expert 汇总与对齐**  
+   对本地每个 expert，把所有 rank 发来的计数相加，并按 `expert_alignment` 对齐：
+
+   ```cpp
+   // dispatch.cuh:204-214
+   int sum = 0;
+   for (int j = 0; j < kNumRanks; ++ j)
+       sum += expert_count[j * kNumExpertsPerRank + i];
+   expert_count[i] = math::align(sum, kExpertAlignment);
+
+   if (cumulative_local_expert_recv_stats != nullptr)
+       atomicAdd(cumulative_local_expert_recv_stats + i, sum);
+   ```
+
+6. **生成 prefix sum**  
+   - `psum_num_recv_tokens_per_scaleup_rank`：对去重后的 `rank_count` 做 inclusive prefix sum，最后一个元素即本次 dispatch 本 rank 总共收到的 token 数。
+   - `psum_num_recv_tokens_per_expert`：对对齐后的本地 expert 计数做 exclusive prefix sum，用于 expand 布局中的 scatter/gather 偏移。
+
+##### 4.2.1.4 统计产物的业务用途
+
+| 产物 | 形状 / 位置 | 业务意义 |
+|---|---|---|
+| `rank_count` | 共享内存 / workspace | 本 rank 发给每个 peer 的 **去重后** token 数 |
+| `expert_count` | 共享内存 / workspace | 本 rank 发给每个全局 expert 的 token 数（不去重） |
+| `cumulative_local_expert_recv_stats` | `[num_local_experts]`，可选 | 每个本地 expert 收到的总 token 数，用于负载均衡监控 / load balance loss（`elastic.py:743-744`） |
+| `psum_num_recv_tokens_per_scaleup_rank` | `[num_scaleup_ranks]` | 来自各 rank 的 token 在接收 buffer 中的 inclusive 偏移；最后一个元素为总接收 token 数 |
+| `psum_num_recv_tokens_per_expert` | `[num_local_experts]` | expand 模式下各 expert 在输出 buffer 中的 exclusive 偏移 |
+| `dst_buffer_slot_idx` | `[num_tokens, num_topk]` | 每个 `(token, top-k)` 在目标 rank 接收 buffer 中的 slot 索引，combine 反向路由的关键 |
+
+`dst_buffer_slot_idx` 在普通模式下由 dispatch data warps 通过 `atomicAdd` 在 `scaleup_atomic_sender_counter` 上动态分配：
+
+```cpp
+// dispatch.cuh:338-343
+if (ptx::deduplicate(stored_dst_rank_idx, lane_idx) and stored_dst_rank_idx >= 0)
+    stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_rank_idx, 1);
+```
+
+在 `deterministic` 或 `cached_mode` 下，它由 `dispatch_deterministic_prologue` 通过前缀和 **确定性预分配**，避免原子操作带来的不确定性。
+
+##### 4.2.1.5 Notify 与 NCCL GIN
+
+Notify 阶段的 all-to-all 计数交换走的就是 NCCL GIN：
+
+```cpp
+// dispatch.cuh:153-157
+gin.put_value<team_t>(workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx,
+                      static_cast<int64_t>(rank_count[i]), i,
+                      ncclGinOptFlagsAggregateRequests);
+```
+
+体积小、延迟低，且通过 `ncclGinOptFlagsAggregateRequests` 聚合多个小写，减少 doorbell 开销。这与后续 data warps 用 `gin.put` 传输 token hidden 向量使用同一套 GIN 后端，只是传的是 metadata。
+
+##### 4.2.1.6 Notify 阶段流程图
+
+```mermaid
+flowchart TD
+    A["每个 notify warp 按步长遍历 token"] --> B["lane 读取 topk_idx"]
+    B --> C["atomicAdd_block expert_count[dst_expert]"]
+    B --> D["deduplicate 后 atomicAdd_block rank_count[dst_rank]"]
+    C --> E["跨 SM red_add 到 workspace 64-bit 计数器"]
+    D --> E
+    E --> F{"SM0 检测到所有 SM 到达?"}
+    F -->|否| E
+    F -->|是| G["put_value rank_count 给所有 peers"]
+    F -->|是| H["put expert_count 给所有 peers"]
+    G --> I{"所有 peer 计数已到达?"}
+    H --> I
+    I -->|否| I
+    I -->|是| J["汇总本地 expert 接收数并按 expert_alignment 对齐"]
+    J --> K["生成 psum_num_recv_tokens_per_scaleup_rank"]
+    J --> L["生成 psum_num_recv_tokens_per_expert"]
+    K --> M["dispatch warps 开始实际数据搬运"]
+    L --> M
+```
 
 #### 4.2.2 Dispatch 阶段
 
@@ -556,4 +699,27 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
     DGPU1 -->|\"NVLink TMA store<br/>scale-out send buffer\"| DGPU0
     DGPU0 -->|\"RDMA PUT\"| SGPU
     SGPU -->|\"NVLink / 本地 reduce<br/>得到 combined_x\"| SGPU"
+```
+
+### A.6 Notify 阶段详细流程
+
+```text
+"flowchart TD
+    A[\"每个 notify warp 按步长遍历 token\"] --> B[\"lane 读取 topk_idx\"]
+    B --> C[\"atomicAdd_block expert_count[dst_expert]\"]
+    B --> D[\"deduplicate 后 atomicAdd_block rank_count[dst_rank]\"]
+    C --> E[\"跨 SM red_add 到 workspace 64-bit 计数器\"]
+    D --> E
+    E --> F{\"SM0 检测到所有 SM 到达?\"}
+    F -->|否| E
+    F -->|是| G[\"put_value rank_count 给所有 peers\"]
+    F -->|是| H[\"put expert_count 给所有 peers\"]
+    G --> I{\"所有 peer 计数已到达?\"}
+    H --> I
+    I -->|否| I
+    I -->|是| J[\"汇总本地 expert 接收数并按 expert_alignment 对齐\"]
+    J --> K[\"生成 psum_num_recv_tokens_per_scaleup_rank\"]
+    J --> L[\"生成 psum_num_recv_tokens_per_expert\"]
+    K --> M[\"dispatch warps 开始实际数据搬运\"]
+    L --> M"
 ```
