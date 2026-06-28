@@ -336,6 +336,156 @@ flowchart TD
     L --> M
 ```
 
+##### 4.2.1.7 Notify 的 all-to-all 本质与 dispatch/combine 的稀疏性
+
+Notify 看起来只是“数数”，但它在通信模式上是 **结构化的 all-to-all**；而 dispatch/combine 的实际数据搬运则是一张 **由 top-k 路由诱导的稀疏图**。
+
+###### 为什么 notify 必须是 all-to-all
+
+在 `dispatch.cuh:151-157` 中，SM0 向 **所有 peer rank** 发送本 rank 的计数：
+
+```cpp
+for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
+    const auto dst_rank_counter =
+        workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx;
+    gin.put_value<team_t>(dst_rank_counter, static_cast<int64_t>(rank_count[i]), i,
+                          ncclGinOptFlagsAggregateRequests);
+}
+```
+
+注意循环变量 `i` 遍历 `0 .. kNumRanks-1`，**不会因为 `rank_count[i] == 0` 而跳过**。原因很本质：
+
+> 接收端在拿到 peer 计数之前，**不知道谁会给自己发数据、发多少**。因此每个 rank 必须显式告诉所有 peer：“我要发给你 `rank_count[i]` 个 token”，即使这个数是 0。
+
+这是一种 **all-to-all of metadata**，和 NCCL all-to-all 在通信模式上是完全一致的。
+
+###### 为什么 dispatch/combine 是稀疏的
+
+Dispatch 的数据搬运只发生在 token 的 top-k 专家实际落到的那些 rank 上：
+
+```cpp
+// dispatch.cuh:370-385
+const auto dst_ptr = stored_dst_slot_idx >= 0 ?
+    gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
+    nullptr;
+if (dst_ptr != nullptr)
+    ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
+```
+
+`stored_dst_rank_idx` 来自 `topk_idx[token, lane] / kNumExpertsPerRank`。如果某个 token 的 top-2 都落在 rank 3 和 rank 7 上，它**只**会发给 rank 3 和 rank 7，不会 touch 其他 rank。Combine 同理：只从那些曾经给本 rank 发过 token 的源 rank 读取数据。
+
+```mermaid
+flowchart TB
+    subgraph Notify["Notify: 结构化 all-to-all"]
+        direction LR
+        R0["R0"] --> R1["R1"]
+        R0 --> R2["R2"]
+        R0 --> R3["R3"]
+        R1 --> R0
+        R1 --> R2
+        R1 --> R3
+        R2 --> R0
+        R2 --> R1
+        R2 --> R3
+        R3 --> R0
+        R3 --> R1
+        R3 --> R2
+    end
+
+    subgraph Dispatch["Dispatch/Combine: 由 top-k 诱导的稀疏图"]
+        direction LR
+        T0["token A<br/>top-k on R1,R2"] --> R1
+        T0 --> R2
+        T1["token B<br/>top-k on R0"] --> R0
+        T2["token C<br/>top-k on R2,R3"] --> R2
+        T2 --> R3
+    end
+```
+
+###### 实际业务中的稀疏程度
+
+MoE 训练通常会用 **load-balancing loss** 约束，使 token 尽量均匀分散到所有 expert，因此：
+
+- 每个 token 的 top-k 通常会落在 **k 个不同 rank** 上；
+- 每个 rank 也会从 **几乎所有其他 rank** 收到一些 token。
+
+所以在典型训练场景下，dispatch/combine 的实际 peer 覆盖度很高，**接近 all-to-all**。但在以下场景下稀疏性会很明显：
+
+| 场景 | 效果 |
+|---|---|
+| **推理解码，batch size = 1 或很小** | 每个 token 只去 k 个 rank，大量 rank 之间没有数据交换 |
+| **gate 分布高度偏斜** | 热门 expert 集中在少数 rank，冷门 rank 之间无交互 |
+| **专家分组 / 层次 MoE** | token 只在某个专家子集内路由，rank 覆盖度天然受限 |
+| **cached handle 稳定路由** | 数据搬运模式固定，但 notify 仍需走全量 |
+
+##### 4.2.1.8 Notify 的开销到底重不重
+
+_notify 的“重”不是重在网络/HBM 数据搬运，而是重在 **同步延迟** 和 **关键路径占比** 上。_
+
+###### 数据量上：notify 极轻
+
+| 阶段 | 每个 token 搬运的数据 | 典型规模 |
+|---|---|---|
+| **notify** | 几个 int64 计数 | 几 byte ~ 几十 byte |
+| **dispatch** | hidden 向量 + topk metadata + scale factors | 通常 1KB~4KB/token |
+| **combine** | 专家输出 hidden 向量 | 通常 1KB~4KB/token |
+
+按字节数算，notify 的数据量只有 dispatch/combine 的千分之一，不会吃掉网络带宽。
+
+###### 同步开销上：notify 很重
+
+Notify 在 dispatch kernel 内部做了大量 **必须串行完成的同步**：
+
+1. 跨 SM `red_add` 归约，要等所有 `num_sms` 到达；
+2. 向所有 peer 发计数，再等所有 peer 计数返回；
+3. 拿到全部计数后才能做 prefix sum；
+4. prefix sum 完成后 data warps 才能开始搬第一个 token。
+
+```mermaid
+flowchart LR
+    A["dispatch kernel launch"] --> B["notify: 计数 + all-to-all + wait"]
+    B --> C["dispatch warps 搬数据"]
+    C --> D["barrier"]
+    D --> E["copy epilogue"]
+```
+
+因此 **notify 的延迟占比在小 batch、低延迟推理时会比较显眼**；在大 batch 训练中，dispatch/combine 的数据搬运时间长，notify 的同步时间就被掩盖了。
+
+###### 什么时候 notify 会成为瓶颈
+
+| 场景 | 原因 |
+|---|---|
+| **小 batch / 低延迟推理** | token 数据量小，notify 同步延迟占比高 |
+| **跨节点 scale-out** | RDMA 往返延迟比 NVLink 高一个数量级 |
+| **CPU sync 开启** | CPU 必须等 GPU notify 完成，无法与 CUDA graph 协同 |
+| **路由稀疏** | dispatch 实际数据交换少，但 notify 仍要全量 all-to-all |
+
+这也是为什么 DeepEP 把以下机制作为降低延迟的核心手段：
+
+| 机制 | 如何缓解 notify 开销 |
+|---|---|
+| **`EPHandle` 缓存** | 推理解码时若 gate 决策不变，**完全跳过本次 notify** |
+| **`do_cpu_sync=False`** | GPU 端按最大 buffer 异步分配，避免 CPU 等待 |
+| **`ncclGinOptFlagsAggregateRequests`** | 聚合多个 `put_value`，减少 doorbell 和 QP 头开销 |
+| **64-bit packed `red_add`** | 计数 + SM 到达计数一次 atomic 完成 |
+| **deterministic prologue** | 把 slot 分配从主 kernel 拆出，减少主 kernel 内串行时间 |
+
+###### 能否让 notify 也变成稀疏的
+
+理论上可以，但需要额外假设：
+
+1. **所有 rank 事先知道路由模式**（例如 cached handle）→ 直接复用上一次结果，不再交换计数。
+2. **允许 over-provisioning**：接收端按最大可能 token 数分配 buffer，不再询问每个 peer 具体发多少。代价是 buffer 和计算浪费。
+3. **使用稀疏 all-to-all 原语**：但即便如此，确定“哪些 peer 会发给我”本身也需要一次通信，无法完全避免。
+
+在没有先验路由信息的情况下，**notify 的 all-to-all 是一个下界**：你必须以某种方式让每个 rank 知道“谁会给我发、发多少”。
+
+###### 小结
+
+> **notify 是 DeepEP dispatch 中唯一结构化的 all-to-all 步骤；dispatch 和 combine 只是由 top-k 路由诱导出的稀疏数据图。**
+>
+> 当 MoE 路由接近均匀时，dispatch/combine 的实际 peer 覆盖度也很高，notify 的相对开销被掩盖；当 batch 小、路由偏斜或使用稀疏专家结构时，notify 的固定 all-to-all 开销会凸显出来。DeepEP 通过 **handle 缓存** 和 **async / no CPU sync** 模式，本质上都是在绕过或重叠 notify 这条强制性的控制路径。
+
 #### 4.2.2 Dispatch 阶段
 
 1. 每个 SM 的剩余 warp 作为 dispatch warps。每个 warp 是一个 **channel**。
@@ -593,7 +743,11 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
 4. **全 JIT + 解析式调参**：无需离线 tuning，安装简单。
 5. **丰富的精度与模式**：BF16 / FP8、expand / non-expand、multiple reduction、CPU sync / async、handle 缓存。
 
-理解 `dispatch` 与 `combine` 的关键，在于把握 **token 路由 -> 计数同步 -> 异步搬运 -> barrier -> epilogue 整理** 这一完整闭环，以及 DeepEP 如何在 NVLink 与 RDMA 两种物理介质上高效实现这一闭环。
+理解 `dispatch` 与 `combine` 的关键，在于把握 **token 路由 -> 计数同步 -> 异步搬运 -> barrier -> epilogue 整理** 这一完整闭环，以及 DeepEP 如何在 NVLink 与 RDMA 两种物理介质上高效实现这一闭环。需要特别注意的是：
+
+- **notify 阶段是 dispatch 中唯一结构化的 all-to-all 步骤**，它只交换元数据（计数），不搬 token 数据；
+- **dispatch 与 combine 的实际数据图由 top-k 路由诱导**，在均匀负载下接近 all-to-all，在小 batch 或偏斜路由下则可能非常稀疏；
+- notify 的“重”主要体现在 **同步延迟** 和 **关键路径占比** 上，DeepEP 通过 `EPHandle` 缓存、`do_cpu_sync=False`、NCCL GIN 小消息聚合等机制专门规避或重叠这条控制路径。
 
 ---
 
@@ -722,4 +876,44 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
     J --> L[\"生成 psum_num_recv_tokens_per_expert\"]
     K --> M[\"dispatch warps 开始实际数据搬运\"]
     L --> M"
+```
+
+### A.7 Notify 的 all-to-all 本质 vs dispatch/combine 的稀疏性
+
+```text
+"flowchart TB
+    subgraph Notify[\"Notify: 结构化 all-to-all\"]
+        direction LR
+        R0[\"R0\"] --> R1[\"R1\"]
+        R0 --> R2[\"R2\"]
+        R0 --> R3[\"R3\"]
+        R1 --> R0
+        R1 --> R2
+        R1 --> R3
+        R2 --> R0
+        R2 --> R1
+        R2 --> R3
+        R3 --> R0
+        R3 --> R1
+        R3 --> R2
+    end
+
+    subgraph Dispatch[\"Dispatch/Combine: 由 top-k 诱导的稀疏图\"]
+        direction LR
+        T0[\"token A<br/>top-k on R1,R2\"] --> R1
+        T0 --> R2
+        T1[\"token B<br/>top-k on R0\"] --> R0
+        T2[\"token C<br/>top-k on R2,R3\"] --> R2
+        T2 --> R3
+    end"
+```
+
+### A.8 Notify 在 dispatch 关键路径上的位置
+
+```text
+"flowchart LR
+    A[\"dispatch kernel launch\"] --> B[\"notify: 计数 + all-to-all + wait\"]
+    B --> C[\"dispatch warps 搬数据\"]
+    C --> D[\"barrier\"]
+    D --> E[\"copy epilogue\"]"
 ```
