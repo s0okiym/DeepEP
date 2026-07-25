@@ -2,6 +2,8 @@
 
 > 文档版本：基于 DeepEP V2（NCCL Gin backend + CUDA Driver API）。
 > 阅读对象：希望理解 DeepEP 如何利用 RDMA / NVLink 原语、如何组织 QP / channel / symmetric memory，以及各项优化背后的场景与动机的工程师。
+>
+> 相关 notes：[EP 主路径](deep_ep_explained.md) · [NCCL GIN 内部](nccl_gin_internals.md) · [JIT / 重叠 / Engram·PP·AGRS](deep_ep_runtime_and_experimental.md)
 
 ---
 

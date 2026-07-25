@@ -2,6 +2,8 @@
 
 > 文档版本：基于 DeepEP V2（`ElasticBuffer` + NCCL Gin backend）。
 > 阅读对象：希望理解 DeepEP 设计目标、完成的具体工作，以及 `dispatch` / `combine` 内部机制的工程师。
+>
+> 相关 notes：[传输层](deep_ep_transport.md) · [NCCL GIN 内部](nccl_gin_internals.md) · [JIT / 重叠 / Engram·PP·AGRS](deep_ep_runtime_and_experimental.md)
 
 ---
 

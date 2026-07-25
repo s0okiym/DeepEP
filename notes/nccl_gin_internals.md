@@ -1,6 +1,8 @@
 # NCCL GIN 内部实现解析：机制、流程与原理
 
 > 文档版本：基于 NCCL master（2026-06）源码，重点分析 `src/include/nccl_device/gin*.h`、`src/include/nccl_device/impl/gin__funcs.h`、`src/gin/gin_host.cc`、`src/gin/gin_host_proxy.cc` 及 GDAKI/GPI/Proxy 三个后端头文件。
+>
+> 相关 notes：[EP 主路径](deep_ep_explained.md) · [传输层](deep_ep_transport.md) · [JIT / 重叠 / Engram·PP·AGRS](deep_ep_runtime_and_experimental.md)
 
 ---
 
