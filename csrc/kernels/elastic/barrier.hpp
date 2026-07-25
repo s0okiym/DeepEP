@@ -18,9 +18,10 @@ public:
         bool is_scaleup_nvlink;
         int num_scaleout_ranks, num_scaleup_ranks;
         int64_t num_timeout_cycles;
+        bool sequential;
 
         // Parameters
-        ncclDevComm_t nccl_dev_comm;
+        jit::NoRefPtr nccl_dev_comm;
         ncclWindow_t nccl_window;
         void* workspace;
         int scaleout_rank_idx, scaleup_rank_idx;
@@ -35,12 +36,12 @@ public:
 using namespace deep_ep::elastic;
 
 static void __instantiate_kernel() {{
-    auto ptr = reinterpret_cast<void*>(&barrier_impl<{}, {}, {}, {}, {}, {}>);
+    auto ptr = reinterpret_cast<void*>(&barrier_impl<{}, {}, {}, {}, {}, {}, {}>);
 }}
 )",                        args.is_scaleup_nvlink,
                            args.launch_args.grid_dim.first, args.launch_args.num_threads,
                            args.num_scaleout_ranks, args.num_scaleup_ranks,
-                           args.num_timeout_cycles);
+                           args.num_timeout_cycles, args.sequential);
     }
 
     static void launch_impl(const jit::KernelHandle& kernel, const jit::LaunchConfigHandle& config, Args args) {
@@ -52,23 +53,26 @@ static void __instantiate_kernel() {{
     }
 };
 
-static void launch_barrier(const ncclDevComm_t& nccl_dev_comm, const ncclWindow_t& nccl_window,
+static void launch_barrier(const jit::NoRefPtr& nccl_dev_comm, const ncclWindow_t& nccl_window,
                            void* workspace,
                            const int& scaleout_rank_idx, const int& scaleup_rank_idx,
                            const int& num_scaleout_ranks, const int& num_scaleup_ranks,
                            const int64_t& num_timeout_cycles,
                            const bool& is_scaleup_nvlink,
+                           const bool& sequential,
                            const at::cuda::CUDAStream& stream) {
     // Number of threads equals to the number of ranks
     constexpr auto kNumThreads = 512;
 
     // Generate, build and launch
-    // NOTES: only the hybrid kernel needs 2 SMs
-    const auto num_sms = num_scaleout_ranks > 1 ? 2 : 1;
+    // NOTES: only the parallel hybrid kernel needs 2 SMs; the sequential mode does scaleout and
+    // scaleup one after another, so a single SM is sufficient.
+    const auto num_sms = (not sequential and num_scaleout_ranks > 1) ? 2 : 1;
     const BarrierRuntime::Args args = {
         .is_scaleup_nvlink = is_scaleup_nvlink,
         .num_scaleout_ranks = num_scaleout_ranks, .num_scaleup_ranks = num_scaleup_ranks,
         .num_timeout_cycles = num_timeout_cycles,
+        .sequential = sequential,
         .nccl_dev_comm = nccl_dev_comm,
         .nccl_window = nccl_window,
         .workspace = workspace,
