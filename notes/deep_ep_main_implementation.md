@@ -82,7 +82,7 @@ DeepEP V2(本仓库 main 分支的 `ElasticBuffer`,v2.1.0)针对性重构:
 | **dispatch / combine** | EP 的两次 all-to-all:token 送往专家所在 rank / 结果加权回传 |
 | **scale-up 域(NVLink 域)** | 机内 NVLink 全互联的一组 rank(如 NVL72 的 72 卡);NCCL 中对应 **LSA 团队**(Local Scaleup Access,`ncclTeamLsa`) |
 | **scale-out 域** | 跨机 RDMA 部分;多个 scale-up 域组成全集群 |
-| **物理/逻辑域大小** | `get_physical_domain_size` = (world 中 RDMA 连接的 rail 数, NVLink 域大小);`get_logical_domain_size` 将其规整为规整的 `scaleout_ranks × scaleup_ranks` 矩形(允许 NVLink 域小于 rail 数时"折叠"),所有 kernel 按逻辑域计算 |
+| **物理/逻辑域大小** | `get_physical_domain_size` = (world / NVLink 域大小, NVLink 域大小),并断言 `num_ranks % num_nvl_ranks == 0`(要求整除,nccl.cu:49-60);`get_logical_domain_size` = hybrid 时 `(num_rdma_ranks, num_nvl_ranks)`、非 hybrid 时 `(1, world)`,无"折叠"机制,所有 kernel 按逻辑域计算 |
 | **direct 模式** | 所有 rank 对直接走 RDMA(或 NVLink),单层 all-to-all |
 | **hybrid 模式** | 两级流水线:域内 NVLink + 域间 RDMA。"scale-out warp"先做跨域搬运,"forward warp"再做域内分发,两级重叠 |
 | **channel** | V2 kernel 里"一条 warp = 一个 channel",channel 之间互不依赖地搬运 token 子集;channel 总数 = SM 数 × 每 SM channel 数(≤ 8) |
@@ -91,7 +91,7 @@ DeepEP V2(本仓库 main 分支的 `ElasticBuffer`,v2.1.0)针对性重构:
 | **GDAKI signal table** | GDAKI 后端维护的 GPU 可见信号计数器表,DeepEP barrier 直接轮询该表实现带超时的跨 rank 同步 |
 | **对称内存 / window** | 每个 rank 在同一逻辑偏移处都有相同布局的内存块;NCCL 通过 `ncclCommWindowRegister` 注册 **window**,设备端用"偏移 + 目标 rank"即可得到对端指针,无需每地址一次注册 |
 | **LSA 指针(`ncclGetLsaPointer`)** | 同 NVLink 域内,按 window 偏移取对端 GPU 的可直读写指针(NVLink P2P) |
-| **slot** | 接收端缓冲中一个 token 的位置编号;dispatch 时按 expert 顺序原子分配 slot,combine 时原路寻址 |
+| **slot** | 接收端缓冲中一个 token 的位置编号;dispatch 时由数据 warp 按"源 rank 遍历 token/channel 的到达顺序"原子分配(`atomicAdd`,dispatch.cuh:344-345),并非按 expert 顺序;non-expand 模式接收顺序不确定,靠 `EPHandle.deterministic_sort` 事后排序;combine 时原路寻址 |
 | **expand layout** | 一种接收布局:按 expert 展开存储(每个 (token, expert) 占一行),供不需要"聚合回 token"的下游直接消费;与"聚合布局"相对 |
 | **SF / scale factor / FP8** | dispatch 可把 token 以 FP8 发送(数据 + 缩放因子);`sf_pack_t` 打包 4 个 UE8M0(E8M0 格式的 scale)为一包,`KNumSFPacks` 为每 token 的 SF 包数 |
 | **EPHandle** | 一次 dispatch 返回的句柄(`psum` 偏移、每 expert 计数、`recv_src_metadata`、`dst_buffer_slot_idx`、`token_metadata_at_forward`、`channel_linked_list` 等),供后续 combine 精确寻址,免去 combine 重新计算布局 |
@@ -121,18 +121,20 @@ DeepEP/
 │   │   ├── legacy.py           # V1 API:dispatch / internode_* / low_latency_* / Config
 │   │   └── elastic.py          # ★ V2 API:ElasticBuffer(dispatch/combine/engram/pp/agrs)
 │   ├── include/deep_ep/        # 设备端头文件(随 pip 包发行,供 JIT 编译)
-│   │   ├── common/             # handle.cuh / comm.cuh / layout.cuh / ptx.cuh / exception.cuh
-│   │   ├── impls/              # dispatch / combine / *_copy_epilogue / hybrid_* / engram / pp / agrs / barrier
+│   │   ├── common/             # handle.cuh / comm.cuh / layout.cuh / ptx.cuh / compiled.cuh(sf_pack_t、topk_idx_t、kGinQPDepth=1024)/ math.cuh / exception.cuh
+│   │   ├── impls/              # dispatch / combine / *_copy_epilogue / hybrid_* / engram / pp / barrier(无 agrs,AGRS 为纯 host 侧实现)
 │   │   ├── jit/  (如存在)      # JIT 相关的设备端片段
 │   │   └── ...
-│   ├── utils/                  # envs.py(带宽探测/初始化)、gate.py、refs.py、event_overlap 等
+│   ├── utils/                  # envs.py(带宽探测/初始化)、event.py(EventOverlap/EventHandle)、comm.py、find_pkgs.py、math.py、semantic.py、testing.py、gate.py、refs.py 等
 │   └── ...
 ├── csrc/
 │   ├── python_api.cpp          # pybind 入口(pybind11 → C++ API)
 │   ├── elastic/buffer.hpp      # ★ ElasticBuffer 的 C++ host 类(workspace 布局、host 同步)
 │   ├── kernels/
 │   │   ├── backend/            # api.cuh / nccl.cu / nvshmem.cu / symmetric.hpp / cuda_driver.cu
-│   │   └── legacy/             # V1 kernel:AOT 编译(intranode / internode / internode_ll / layout / config)
+│   │   ├── elastic/            # EPv2 kernel 启动层(dispatch / combine / barrier / engram / pp_send_recv / api.hpp):SM/channel/warp 数装配、kNumNotifyWarps、cluster/cooperative/PDL launch 参数
+│   │   └── legacy/             # V1 kernel:AOT 编译(intranode / internode / internode_ll / layout)
+│   ├── legacy/                 # V1 C++ host:buffer.hpp(host 类)+ config.hpp(V1 Config/LowLatencyLayout)
 │   ├── jit/                    # ★ JIT 子系统:compiler / cache / kernel_runtime / launch_runtime / include_parser
 │   └── indexing/main.cu        # "编译冒烟测试":#include 全部 EPv2 impl + 空 main()
 ├── tests/                      # elastic / legacy / utils 三套测试
@@ -188,9 +190,9 @@ NCCL(Gin/GDAKI → RDMA NIC doorbell;window/LSA → NVLink P2P)  +  可选 NVSHM
 
 ### 4.2 NCCL 通信与域划分
 
-- `create_nccl_comm`:创建 NCCL communicator(尊重 `EP_SUPPRESS_NCCL_CHECK`、`EP_NIC_NAME`、`EP_OVERRIDE_RDMA_SL` 等环境变量)。
+- `create_nccl_comm`:创建 NCCL communicator,**不读任何环境变量**(nccl.cu:28-41 仅 `ncclCommInitRank`)。相关环境变量的真实归属:`EP_SUPPRESS_NCCL_CHECK` 用于 `deep_ep/__init__.py` 的 `check_nccl_so()`;`EP_NIC_NAME` 用于 `deep_ep/utils/envs.py`(默认 NIC 名);`EP_OVERRIDE_RDMA_SL` 用于 `elastic.py`(覆盖 `sl_idx`)。
 - **物理域大小** `get_physical_domain_size`:经 `ncclTeamWorld/ncclTeamLsa` 读出 (rail 数, NVLink 域大小)。
-- **逻辑域大小** `get_logical_domain_size`:把物理 (rdma_ranks, nvl_ranks) 规整成规整矩形 (scaleout_ranks, scaleup_ranks)。允许 NVLink 域"装不满"一条 rail 的折叠情况,所有 EPv2 kernel 一律按逻辑域做模板参数。
+- **逻辑域大小** `get_logical_domain_size`:hybrid 时 = 物理域 (rdma_ranks, nvl_ranks),非 hybrid 时 = (1, world)(nccl.cu:56-60)。物理域构造即断言 `num_ranks % num_nvl_ranks == 0`(整除),不存在"折叠/规整"机制,所有 EPv2 kernel 一律按逻辑域做模板参数。
 - `EP_DISABLE_GIN=1` 是逃生门:强制回退(创建后 assert GIN 类型非 NONE 的断言被跳过),用于 NCCL/GDAKI 不可用时的诊断。
 
 ### 4.3 `NCCLSymmetricMemoryContext`(nccl.cu)
@@ -217,13 +219,13 @@ NCCL(Gin/GDAKI → RDMA NIC doorbell;window/LSA → NVLink P2P)  +  可选 NVSHM
 |---|---|---|
 | `GPUSymmetricMemory` | 纯 GPU | `ncclMemAlloc` |
 | `ElasticSymmetricMemory` | **同一 VA 段 [GPU 前部][CPU 后部]** | CUDA VMM(`cuMemCreate/cuMemMap/cuMemAddressReserve`),GPU 段 + CPU(pinned)段连续映射;`cumem_create_with_fallback` 优先 FABRIC handle、失败退回 POSIX handle;`set_access` 对 peer GPU 与本 NUMA 放开 |
-| `HybridElasticSymmetricMemory` | **[GPU 段][CPU 段: rank0\|rank1\|…] 每 rank 一段** | 每 rank 的 CPU 段在**本 rank 的 NUMA 节点本地**分配;跨进程共享用 **POSIX FD 传递**:rank 0 用 `create_cpu_handle` 导出 FD,各 NVLink 域内 peer 用 **`pidfd_open` + `pidfd_getfd`** 取回 FD 并 `cuMemMap` 进自己的 VA;用完 `release` 句柄。这是"GPU 显存 + 每卡 NUMA 本地内存"混合缓冲(Engram 的 CPU 存储就建在这上面)的基础 |
+| `HybridElasticSymmetricMemory` | **[GPU 段][CPU 段: rank0\|rank1\|…] 每 rank 一段** | 每 rank 的 CPU 段在**本 rank 的 NUMA 节点本地**分配;跨进程共享用 **POSIX FD 传递**:每个 rank 都调用 `create_cpu_handle` 导出本 rank 的 `(pid, fd)`,再经 `dist.all_gather_object` 交换全部 handle(elastic.py:338-342);每个 rank 用 **`pidfd_open` + `pidfd_getfd`** 取回本 NVLink 域内各 peer 的 FD 并 `cuMemMap` 进自己的 VA(symmetric.hpp:224-242)。不存在"rank 0 统一导出"。这是"GPU 显存 + 每卡 NUMA 本地内存"混合缓冲(Engram 的 CPU 存储就建在这上面)的基础 |
 
-`alloc()` 工厂按"是否有 CPU 字节 + 是否需要 per-rank NUMA 本地"选择实现,并设置 `NCCL_ELASTIC_BUFFER_REGISTER=1`。
+`alloc()` 工厂按"是否有 CPU 字节 + 是否需要 per-rank NUMA 本地"选择实现;`NCCL_ELASTIC_BUFFER_REGISTER=1` 仅当实现为 `ElasticSymmetricMemory`(CPU-backed)时才 setenv(symmetric.hpp:313-315),Hybrid/GPU 分配器不设置。
 
 ### 4.5 GPU+CPU 混合缓冲与超大 CPU 段
 
-`ElasticBuffer` 构造参数 `num_bytes`(GPU 段)与 `num_cpu_bytes`(CPU 段)正交:EP 数据默认走 GPU 段;当 CPU 段大到超出 `NCCL_WIN_STRIDE` 表达能力时,Python 侧会分片处理,保证 window 偏移算术仍然成立。host 侧另有一块 `cudaMallocHost(cudaHostAllocMapped)` 的 **host_workspace**,用于 GPU kernel 把"接收 token 数"等标量直接写进 host 可见内存(kDoCPUSync 路径),CPU 无需额外同步即可读。
+`ElasticBuffer` 构造参数 `num_bytes`(GPU 段)与 `num_cpu_bytes`(CPU 段)正交:EP 数据默认走 GPU 段;当注册字节总量(num_gpu_bytes + num_cpu_bytes × num_max_local_ranks + 4 GiB slack)超过 GPU 显存总量时,Python 侧把 `NCCL_WIN_STRIDE` 设为 `align(registered_bytes, 1<<32)`(4 GiB 对齐)以扩大 NCCL VA space(elastic.py:284-298),并无分片逻辑。host 侧另有一块 `cudaMallocHost(cudaHostAllocMapped)` 的 **host_workspace**,用于 GPU kernel 把"接收 token 数"等标量直接写进 host 可见内存(kDoCPUSync 路径),CPU 无需额外同步即可读。
 
 ---
 
@@ -252,12 +254,12 @@ NCCL(Gin/GDAKI → RDMA NIC doorbell;window/LSA → NVLink P2P)  +  可选 NVSHM
 
 **(b) QP 分配 `get_qp_mode`。** 规则:
 
-- 只有 1 个 QP:全局共享(`NCCL_GIN_RESOURCE_SHARING_GPU`);
+- 只有 1 个 QP:按 `kSharingGrid` 共享(`kSharingGrid = (kNumSMs == 1) ? SHARING_CTA : SHARING_GPU`,comm.cuh:60——单 SM 时是 CTA 共享,并非无条件 GPU 级);
 - notify warp 恒用 QP 0、CTA 内共享;
 - SM 数 ≤ 可用 QP 数:**整 QP 独占给某 SM**(如 3 SM 10 QP:SM0 拿 0,3,6,9;SM1 拿 1,4,7;SM2 拿 2,5,8),CTA 共享模式——独占 QP 的 SM 之间零争抢;
 - SM 数 > QP 数:全体 SM 按 `global_channel_idx % num_qps` 轮转**共享所有 QP**(GPU 共享模式)。
 
-**(c) NVLink barrier(`nvlink_barrier_wo_local_sync`)。** 只用 **1 个 SM**;用**符号翻转协议**:counter 低 2 位编码 (phase, sign),每轮 barrier 所有 rank 向彼此的信号槽 `red_add_rel_sys(±1)`,目标值在 `0` 与 `kNumRanks` 之间交替,counter 每轮 +1——64 位 counter 按"每微秒一次"也要 57 万年才溢出,故可当终身计数器。等待用 `ld.acquire.sys` 轮询,带超时打印。
+**(c) NVLink barrier(`nvlink_barrier_wo_local_sync`)。** 只用 **1 个 SM**;用**符号翻转协议**:counter 低 2 位编码 (phase, sign),每轮 barrier 所有 rank 向彼此的信号槽 `red_add_rel_sys(±1)`,目标值在 `0` 与 `kNumRanks` 之间交替,counter 每轮 +1——64 位 counter 按"每微秒一次"也要 **571000 年**才溢出(comm.cuh:109 注释:`2^64 / 1e6 / 3600 / 24 / 365`),故可当终身计数器。等待用 `ld.acquire.sys` 轮询,带超时打印。
 
 **(d) GIN barrier(`gin_barrier_wo_local_sync`)。** 三步:
 1. **flush 所有 QP**(所有 SM 的所有 warp 分摊 `ncclGin(...).flush(ncclCoopWarp())`;world 团队还要 `fence_acq_rel_sys`,因为 barrier 前可能混有 NVLink 直写,必须系统可见);grid sync;
@@ -268,7 +270,7 @@ NCCL(Gin/GDAKI → RDMA NIC doorbell;window/LSA → NVLink P2P)  +  可选 NVSHM
 
 ### 5.3 `layout.cuh`:WorkspaceLayout
 
-一块对称内存的固定布局(所有 rank 同构):NVLink barrier counter/signal(双相位)→ notify reduction 区(每 rank/每 expert 的 64 位打包计数)→ scaleup rank/expert 计数的 send/recv 双缓冲 → `scaleup_atomic_sender_counter`(slot 分配原子加)→ scaleout rank/expert 计数双缓冲 → channel 级 signaled tail(ranks × channels)→ AGRS 信号区。kernel 之间不传参数,全靠这块"黑板"。
+一块对称内存的固定布局(所有 rank 同构):NVLink barrier counter/signal(双相位)→ notify reduction 区(每 rank/每 expert 的 64 位打包计数)→ scaleup rank/expert 计数的 send/recv 双缓冲 → `scaleup_atomic_sender_counter`(slot 分配原子加)→ scaleout rank/expert 计数双缓冲 → channel 级 signaled tail(ranks × channels)→ PP prev/next 计数区(`get_pp_send/recv_count_ptr`,layout.cuh:74)→ AGRS 信号区。kernel 之间不传参数,全靠这块"黑板"。
 
 ### 5.4 `ptx.cuh`:PTX 工具箱(节选)
 
@@ -304,7 +306,7 @@ V1 kernel 全部 **AOT 编译**进 `deep_ep._C`(见 3.3),API 在 `deep_ep/buffer
 - 布局 `LowLatencyLayout`:**2 个 slot(odd/even 乒乓)** 的 send/recv 数据 + recv count + combine send/recv + **flag**(signal 缓冲与 dispatch count 复用同一块,以 tag 区分)。
 - 单条 dispatch 消息 = `int4` 头 + `max(hidden×bf16, hidden + scales×float)`;单条 combine 消息 = 每 128 通道一个 `nv_bfloat162` scale + `hidden×bf16`。send/recv/signal 三类缓冲各自双份。
 - mask buffer 机制支持推理中动态屏蔽坏 rank。
-- `Config`(lookup 表:按 (num_ranks, num_experts, num_tokens) 给出 SM/通道参数)在 legacy.py 中按规模查表,是 V1 的"准调参"方式。
+- `Config`(lookup 表:仅按 `num_ranks` 查 `config_map`,键 2/4/8/…/160,给出 SM/通道参数;legacy.py:244-259 `get_dispatch_config`)在 legacy.py 中按规模查表,是 V1 的"准调参"方式。
 
 ### 6.4 EventOverlap
 
@@ -316,12 +318,12 @@ V1 kernel 全部 **AOT 编译**进 `deep_ep._C`(见 3.3),API 在 `deep_ep/buffer
 
 ### 7.1 初始化与规模参数
 
-`ElasticBuffer(group, num_bytes?, num_cpu_bytes, num_experts, num_max_tokens_per_rank, num_topk, expert_alignment, …, allow_hybrid_mode, deterministic, prefer_overlap_with_compute, sl_idx=3, num_allocated_qps, num_cpu_timeout_secs=300, num_gpu_timeout_secs=100, …)`。
+`ElasticBuffer(group, num_bytes=None, num_cpu_bytes=0, num_max_tokens_per_rank=0, hidden=0, num_topk=0, use_fp8_dispatch=False, deterministic=False, allow_hybrid_mode=True, allow_multiple_reduction=True, prefer_overlap_with_compute=True, sl_idx=3, num_allocated_qps=0, num_cpu_timeout_secs=300, num_gpu_timeout_secs=100, explicitly_destroy=False)`(`num_experts`/`expert_alignment` 不是构造参数,而是每次 `dispatch` 的逐次参数;elastic.py:228-246)。
 
 **SM/QP 是解析式估算,不是自动调参**:
 
-- `get_theoretical_num_sms`:按"搬多少字节 ÷ (SM 读带宽 + SM 写带宽)"反推最少 SM 数,默认 `sm_read_gbs=200 / sm_write_gbs=50`(可用 `EP_*` 覆盖或实测带宽),乘 **1.25 安全边际**,向上对齐到 2,下限 4,上限取 device SM 数——这就是"24 → 4-6"的来源;
-- `get_theoretical_num_qps`:direct 模式 `min(num_sms, 9)`;hybrid 模式 `num_sms × 16 + 1`(两级流水线对 QP 的需求更大)。`num_allocated_qps` 的默认分配:hybrid 129 / direct 17(留出余量,实际 launch 时按需取子集)。
+- `get_theoretical_num_sms`:按"搬多少字节 ÷ (SM 读带宽 + SM 写带宽)"反推最少 SM 数,`sm_read_gbs=200 / sm_write_gbs=50` 为函数形参默认值(无 `EP_*` 环境变量覆盖;RDMA/NVLink 带宽可自动实测),乘 **1.25 安全边际**,向上对齐到 2,下限 4;`prefer_overlap_with_compute=False` 时先 `max(num_sms, 64)`、最后 `min(device SM 数)`(elastic.py:823-825)——这就是"24 → 4-6"的来源;
+- `get_theoretical_num_qps`:direct 模式 `min(num_sms, 9)`;hybrid 模式 `num_sms × 16 + 1`(两级流水线对 QP 的需求更大)。`num_allocated_qps` 的默认分配(`num_allocated_qps=0` 时):hybrid 且 `check_fast_rdma_atomic_support()` 为真 65、否则 129;非 hybrid 17(elastic.py:328-334;留出余量,实际 launch 时按需取子集)。
 
 ### 7.2 dispatch(direct 模式):notify + dispatch 两类 warp
 
@@ -332,11 +334,11 @@ V1 kernel 全部 **AOT 编译**进 `deep_ep._C`(见 3.3),API 在 `deep_ep/buffer
 3. SM0 等待全体 SM 到达后:把**每 rank 计数**经 `gin.put_value(AggregateRequests)` 聚合发出、**每 expert 计数**按 NVLink 逐元素 put_value 或 RDMA 整块 put 发出;再等回全部 rank 的计数(以正数编码表示"已回填");
 4. **对齐与前缀和**:expert 计数按 `kExpertAlignment` 取整(推理时对齐到 SM 倍数),warp 级 `warp_inclusive_sum` 链算前缀(不依赖 CUB),得到每 (rank, expert) 的接收区段;
 5. `kDoCPUSync` 时把接收 token 总数写进 **mapped host workspace**(CPU 立刻可读,免同步);
-6. notify warp 随后转为 slot 分配:`atomicAdd(scaleup_atomic_sender_counter)` 给每个待发 token 发 slot 号;`kReuseSlotIndices` 时直接复用 EPHandle 缓存的 slot 表。
+6. notify warp 只做计数/归约/前缀和;**slot 分配由数据 warp(dispatch warp)完成**:主循环内对 `deduplicate` 后目的 rank 有效的 lane `atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + dst_rank)` 领取 slot 号(dispatch.cuh:344-345);`kReuseSlotIndices` 时直接复用 EPHandle 缓存的 slot 表。
 
 **dispatch warp 主循环**(每 warp 一个 channel,token 按 channel 跨步切分):
 
-- TMA 1D load:token hidden → smem(mbarrier 双缓冲流水);SF 用 `cp.async` 32-lane 跨步拷;`topk_idx/weights/src_token_global_idx` 一并进 smem;
+- TMA 1D load:token hidden → smem(**单缓冲**:每个 dispatch warp 仅 1 个 tma_buffer + 1 个 mbarrier,靠 phase 翻转复用;循环体开头 `tma_store_wait()` 等上一轮 store 完成后再发下一轮 load,dispatch.cuh:270-284;hybrid_dispatch.cuh:88-89 同为单缓冲);SF 用 `cp.async` 32-lane 跨步拷;`topk_idx/weights/src_token_global_idx` 一并进 smem;
 - 按 slot 决定去向:**NVLink 可达** → `get_sym_ptr` 直写对端接收缓冲(TMA store);**否则** → 写本地 send 缓冲 + `gin.put`(RDMA);
 - 收尾:`gpu_barrier(kDispatchTag1)` + **`cudaTriggerProgrammaticLaunchCompletion()`** 放行 epilogue kernel,并清理自己用过的原子计数器。
 
@@ -347,7 +349,7 @@ V1 kernel 全部 **AOT 编译**进 `deep_ep._C`(见 3.3),API 在 `deep_ep/buffer
 - 接收端把 send 缓冲(或 RDMA 落地缓冲)的 token **拷贝/整理**到最终输出(非 expand 布局:按 token 聚合;expand 布局:按 (token, expert) 展开),每 warp 一个 token,TMA 搬运;
 - hybrid 模式另建 `channel_linked_list`(每 channel 的 token 链),供 combine 反查;
 - `kDoZeroPadding`:把对齐补齐的 padding token 置零;
-- `kCachedMode`(复用 handle)时跳过 CPU 计数读取,直接读 GPU 张量里的 num_recv。
+- `kCachedMode`(复用 handle)时跳过 CPU 计数读取:`num_recv_tokens` 等标量取自 Python 侧 handle 缓存的标量、经参数传入(elastic.py:949-956 → buffer.hpp:1011-1016),不是"直接读 GPU 张量"。
 
 ### 7.4 hybrid 模式:scale-out × scale-up 两级流水线
 
@@ -364,15 +366,15 @@ V1 kernel 全部 **AOT 编译**进 `deep_ep._C`(见 3.3),API 在 `deep_ep/buffer
 `combine_impl<kIsScaleupNVLink, kUseExpandedLayout, kAllowMultipleReduction, …>`,warp = channel,每 token 处理:
 
 1. 读 `recv_src_metadata`(每 2+kNumTopk 元素一组)确定该 token 在各专家 slot 的位置;
-2. **路径 A 无归约**(topk=1 或 `allow_multiple_reduction=False`):TMA load 专家输出 → NVLink 直达源 rank(TMA store 对称指针)或写 send 缓冲 + `gin.put`;
+2. **路径 A 无归约**(`no_local_reduce = not kUseExpandedLayout or (kAllowMultipleReduction and __popc(reduce_valid_mask) == 1)`,combine.cuh:126):TMA load 专家输出 → NVLink 直达源 rank(TMA store 对称指针)或写 send 缓冲 + `gin.put`;
 3. **路径 B 本地归约**(同一 token 的多个专家输出在**本 rank**):`compute_topk_slots`(`__ffs` 位扫描解码,避免 `BRA.DIV`)取出各 topk 槽,simem 内 `combine_reduce`:各 lane 拉 `int4` 向量、按权重累加至多 `kNumTopk/kNumRanks` 项,再一次 TMA store——**归约在 SMEM 完成,不经过全局内存往返**;
-4. **路径 C expand 布局 send-all**:token 命中多个 rank 的专家,按槽位逐一发回。
+4. **路径 C expand 布局 send-all**(`kDoExpandedSend = not kAllowMultipleReduction and kUseExpandedLayout`,combine.cuh:42,即 `allow_multiple_reduction=False` + expand 时走此路径而非路径 A):按槽位逐一发回全部 topk 槽位数据。
 
-topk 权重**写入 token metadata**随数据走,源 rank 端 combine kernel 消费时完成最终加权(权重归一也在 combine 侧)。`use_rank_layout`(`kAllowMultiple_reduction && ranks ≤ topk`)决定接收缓冲按"rank"还是按"topk 槽"组织,压缩缓冲体积。收尾 `gpu_barrier(kCombineTag0/1)`。
+topk 权重**写入 token metadata**随数据走,源 rank 端 combine kernel 消费时完成最终加权(权重归一也在 combine 侧)。`use_rank_layout`(`kAllowMultipleReduction && kNumRanks <= kNumTopk`,combine_utils.cuh:9-14)决定接收缓冲按"rank"还是按"topk 槽"组织,压缩缓冲体积。收尾 `gpu_barrier(kCombineTag0/1)`。
 
 ### 7.6 EPHandle 与确定性
 
-`EPHandle` 缓存 dispatch 的全部布局信息:`do_expand`、`psum_num_recv_tokens_per_scaleup_rank / per_expert`、`num_unaligned_recv_tokens_per_expert`、`recv_src_metadata`、`dst_buffer_slot_idx`、`token_metadata_at_forward`、`channel_linked_list`、`deterministic_sort`。combine 直接消费它 → 免重算、且 `deterministic=True` 时整个 (dispatch, combine) 可复现。`dispatch(do_handle_copy=True)` 默认克隆 `topk_idx`(防用户原地改坏布局)。
+`EPHandle` 缓存 dispatch 的全部布局信息,字段为:`do_expand`、`num_experts`、`expert_alignment`、`num_max_tokens_per_rank`、`num_sms`、`topk_idx`、`psum_num_recv_tokens_per_scaleup_rank / per_expert`、`num_unaligned_recv_tokens_per_expert`、`num_recv_tokens_per_expert_list`、`recv_src_metadata`、`dst_buffer_slot_idx`、`token_metadata_at_forward`、`channel_linked_list`、`num_recv_tokens`、`num_expanded_tokens`、`cached_recv_src_metadata_before_sort`(elastic.py:78-95);`deterministic_sort` 是方法而非字段(elastic.py:100)。combine 直接消费它 → 免重算、且 `deterministic=True` 时整个 (dispatch, combine) 可复现。`dispatch(do_handle_copy=True)` 默认克隆 `topk_idx`(防用户原地改坏布局)。
 
 ### 7.7 实验特性(0 SM / 拷贝引擎)
 
@@ -404,12 +406,12 @@ EPv2 kernel 是重模板(`kNumSMs × kNumRanks × kNumHiddenBytes × kNumQPs × 
 
 - `KernelRuntimeCache`:path → runtime 映射,valid 判定 = `kernel.cu` 与 `kernel.cubin` 双存在;
 - 加载走 **driver API**:`cuModuleLoad / cuModuleGetFunction`;
-- `LaunchRuntime`(CRTP:子类 `generate_impl()` 生成源码 + include 注释):`cuLaunchKernelEx` 启动,`cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` 放大共享内存;模板参数含 PDL 时置 `programmaticStreamSerializationAllowed = 1`——**PDL 属性与 kernel 代码在同一个 JIT 产物里闭环**;
+- `LaunchRuntime`(CRTP:子类 `generate_impl()` 生成源码 + include 注释):`cuLaunchKernelEx` 启动,`cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` 放大共享内存;PDL 属性不取决于模板参数,而取决于每次 launch 的 `LaunchArgs.pdl_enabled` 标志(launch_runtime.hpp:20、59-61;jit/handle.hpp:153 据此置 `programmaticStreamSerializationAllowed = 1`):epilogue 传 `pdl_enabled=true`(dispatch.hpp:336),主 dispatch kernel 传 cooperative(dispatch.hpp:226);
 - **IncludeParser**:源码里 `<deep_ep/*>` 的 include 会被**递归哈希**进 cache key(环检测;非 deep_ep include 直接报错)——改任何一个头文件,全部依赖它的 kernel 自动重编,且不会"改了头没重编"。
 
 ### 8.3 环境变量家族
 
-`EP_JIT_CACHE_DIR`(缓存目录,构建期可烘焙)、`EP_JIT_PRINT_COMPILER_COMMAND`、`EP_JIT_PTXAS_CHECK`、`EP_JIT_SOURCE_DEBUG`;NCCL 侧 `EP_NCCL_ROOT_DIR`(烘焙)、`EP_DISABLE_GIN`、`EP_NIC_NAME`、`EP_OVERRIDE_RDMA_SL`、`EP_GIN_GDAKI_DEBUG`;运行侧 `EP_BUFFER_DEBUG`。
+JIT 侧:`EP_JIT_CACHE_DIR`(缓存目录,构建期可烘焙)、`EP_JIT_DEBUG`、`EP_JIT_PRINT_COMPILER_COMMAND`、`EP_JIT_PTXAS_CHECK`、`EP_JIT_PTXAS_VERBOSE`、`EP_JIT_WITH_LINEINFO`、`EP_JIT_DUMP_ASM/PTX/SASS`、`EP_JIT_NVCC_COMPILER`、`EP_JIT_CPP_STANDARD`(csrc/jit/compiler.hpp);NCCL 侧 `EP_NCCL_ROOT_DIR`(烘焙)、`EP_DISABLE_GIN`、`EP_NIC_NAME`、`EP_OVERRIDE_RDMA_SL`、`EP_GIN_GDAKI_DEBUG`;运行侧 `EP_BUFFER_DEBUG`、`EP_AVOID_RECORD_STREAM`。
 
 ---
 
@@ -428,7 +430,7 @@ EPv2 kernel 是重模板(`kNumSMs × kNumRanks × kNumHiddenBytes × kNumQPs × 
 |---|---|---|---|
 | 1 | **SM 数解析式最小化(24→4-6)** | 带宽反推 + 1.25 边际 + 对齐,运行时按 (tokens, hidden, 拓扑) 算 | `elastic.py: get_theoretical_num_sms` |
 | 2 | **NVLink 直连旁路 RDMA** | `get_sym_ptr` 能取到 LSA 指针就走 `red.add.rel.sys` / 直接 TMA store,零 NIC 开销 | `handle.cuh` |
-| 3 | **TMA + mbarrier 双缓冲流水** | hidden 大块 1D 异步搬运,smem 双槽重叠;`TMACacheHint=EvictFirst` 不污染 L2 | `ptx.cuh`, `dispatch.cuh` |
+| 3 | **TMA + mbarrier 单缓冲流水** | hidden 大块 1D 异步搬运,单 tma_buffer + phase 翻转复用(`tma_store_wait` 串行前后轮);`TMACacheHint=EvictFirst` 不污染 L2 | `ptx.cuh`, `dispatch.cuh` |
 | 4 | **PDL 消除 kernel 间隙** | dispatch 尾部 `cudaTriggerProgrammaticLaunchCompletion()`,epilogue 头部 `cudaGridDependencySynchronize()`,JIT 侧同步置 PDL launch 属性 | `impls/*`, `jit/launch_runtime.hpp` |
 | 5 | **64 位打包原子** | `(1<<32)\|count` 一次原子同时完成"到达计数 + 数据计数" | `dispatch.cuh` notify |
 | 6 | **整 QP 独占 / 共享双模** | SM ≤ QP 时整 QP 给单 SM(零争抢),否则全局轮转共享;notify 恒占 QP0 | `comm.cuh: get_qp_mode` |
@@ -471,6 +473,7 @@ tests/
 |---|---|
 | `deep_ep/buffers/elastic.py` | V2 Python API:构造、hint、dispatch/combine、Engram/PP/AGRS、理论 SM/QP |
 | `csrc/elastic/buffer.hpp` | ElasticBuffer C++ host:workspace、host 同步、launch 装配 |
+| `csrc/kernels/elastic/*.hpp` | EPv2 kernel 启动层(dispatch/combine/barrier/engram/pp_send_recv/api):SM/channel/warp 数装配、`kNumNotifyWarps`、cluster/cooperative/PDL launch 参数 |
 | `csrc/kernels/backend/api.cuh` | 三命名空间后端门面(nvshmem/nccl/cuda_driver) |
 | `csrc/kernels/backend/nccl.cu` | `NCCLSymmetricMemoryContext`:GIN 需求、window 注册、LSA 指针 |
 | `csrc/kernels/backend/symmetric.hpp` | 2MiB 对齐的三类对称内存分配器(GPU / GPU+CPU / per-rank NUMA CPU) |
@@ -484,6 +487,7 @@ tests/
 | `deep_ep/include/deep_ep/impls/combine.cuh` + `combine_utils.cuh` | combine 三路径 + SMEM 归约 + `__ffs` 解码 |
 | `csrc/jit/{compiler,cache,kernel_runtime,launch_runtime,include_parser}.hpp` | JIT 全链路:编译/缓存/原子落盘/driver 加载/PDL 启动/include 哈希 |
 | `csrc/kernels/legacy/*` | V1 三家族 kernel(AOT) |
+| `csrc/legacy/buffer.hpp` | V1 legacy `Buffer` 的 C++ host 类 |
 | `csrc/legacy/config.hpp` | V1 `Config` / `LowLatencyLayout`(2-slot 乒乓) |
 | `deep_ep/buffers/legacy.py` | V1 Python API(`Buffer`) |
 | `csrc/indexing/main.cu` | EPv2 头文件全量"编译冒烟测试" |
