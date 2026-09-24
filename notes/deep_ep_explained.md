@@ -11,7 +11,7 @@
 
 ### 1.1 定位
 
-**DeepEP（DeepEveryParallel）** 是一个面向现代大模型训练与推理的高性能 GPU 通信库。它的核心聚焦点是 **专家并行（Expert Parallelism, EP）**，即为 Mixture-of-Experts（MoE）模型提供高吞吐、低延迟的 all-to-all 通信原语，业内通常称之为 **MoE dispatch / combine**。除此之外，DeepEP 还提供实验性的流水线并行（PP）、上下文并行（CP）以及远程内存访问（Engram）能力。
+**DeepEP（DeepEveryParallel）** 是一个面向现代大模型训练与推理的高性能 GPU 通信库。它的核心聚焦点是 **专家并行（Expert Parallelism, EP）**，即为 Mixture-of-Experts（MoE）模型提供高吞吐、低延迟的 all-to-all 通信原语，业内通常称之为 **MoE dispatch / combine**。除此之外，DeepEP 还提供实验性的流水线并行（PP）、上下文并行（CP）以及远程内存访问（Engram）能力。（README 宣称的 "0 SM CP (with Copy Engine)"：当前代码尚无独立的 CP 拷贝 API，唯一的拷贝引擎零 SM 路径是 AGRS all-gather 的 `cudaMemcpyBatchAsync`，`buffer.hpp:484-492`。）
 
 ### 1.2 与通用集合通信库的区别
 
@@ -27,7 +27,7 @@
 
 1. **统一 API**：高吞吐与低延迟路径统一为单个 `ElasticBuffer`，对外暴露 `dispatch` 与 `combine` 两个核心函数。
 2. **NCCL Gin backend**：基于 NCCL 的 header-only、轻量化设备端通信后端，可直接复用已有 NCCL communicator。
-3. **全 JIT 编译**：所有性能关键 kernel 在运行时编译，安装包无需预编译 CUDA，默认目标 SM90（Hopper）。
+3. **JIT 编译（V2 elastic kernel）**：V2 elastic 的性能关键 kernel 在运行时编译，默认目标 SM90（Hopper）。注意 wheel 构建仍会 AOT 预编译 legacy/backend 的 CUDA 源（`layout.cu` / `intranode.cu` / `internode.cu` / `internode_ll.cu` / `nvshmem.cu` / `nccl.cu` / `cuda_driver.cu`，`setup.py:100-127`），JIT 的只是 V2 elastic kernel。
 4. **拓扑自适应**：自动识别 NVLink / RDMA 物理域，并映射为 scale-up / scale-out 逻辑域；单节点走 NVLink，多节点走 RDMA + NVLink 混合（hybrid mode）。
 5. **解析式调参**：SM 数量与 QP 数量通过带宽模型直接计算，不再需要离线 auto-tuning。
 6. **通信-计算重叠**：通过独立的通信流、`EventOverlap`、CUDA programmatic launch dependency 等机制，使 dispatch/combine 可与 GEMM/Attention 重叠。
@@ -95,7 +95,7 @@ DeepEP V2 充分利用 Hopper（SM90）特性：
 
 - **Workspace**：用于 barrier 信号、计数器、prefix sum、channel tail 等元数据。
 - **GPU buffer**：dispatch / combine 的收发缓存。
-- **CPU buffer**：Engram 等实验功能使用。
+- **CPU buffer**：Engram 等实验功能使用。Engram 的存储支持 BF16 与 FP8：`engram_write(storage, sf)` 可携带全局复制的 scale factors，`engram_fetch(..., use_tma_aligned_col_major_sf)` 可取回 TMA 对齐的列主序 SF（`buffer.hpp:210-325`）。
 
 每个 token 在 buffer 中按 `TokenLayout` 存储，包含：
 
@@ -200,10 +200,10 @@ Dispatch 真正的数据搬运之前，必须先完成 notify 阶段。它的核
 
 ##### 4.2.1.2 Notify 统计的数据结构
 
-在 `dispatch.cuh:78-252` 中，前 `kNumNotifyWarps` 个 warp 专职做统计。每个 SM 在共享内存中维护：
+在 `dispatch.cuh:79-258` 中，前 `kNumNotifyWarps` 个 warp 专职做统计。每个 SM 在共享内存中维护：
 
 ```cpp
-// dispatch.cuh:85
+// dispatch.cuh:86
 int *rank_count = rank_expert_count;                 // [0, num_ranks)
 int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+num_experts)
 ```
@@ -219,7 +219,7 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
    每个 notify warp 按 `global_warp_idx` 步长遍历所有 token，lane $j$ 读取 `topk_idx[token, j]`：
 
    ```cpp
-   // dispatch.cuh:97-105
+   // dispatch.cuh:98-106
    const auto dst_expert_idx = lane_idx < kNumTopk ?
        static_cast<int>(__ldg(topk_idx + i * kNumTopk + lane_idx)) : -1;
    if (dst_expert_idx >= 0)
@@ -234,18 +234,18 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
    所有 SM 通过 `ptx::red_add` 把计数 reduce 到 workspace 的 64-bit 计数器：
 
    ```cpp
-   // dispatch.cuh:111-114
+   // dispatch.cuh:112-115
    const int64_t counter = (1ll << 32ll) | rank_expert_count[i];
    ptx::red_add(workspace_layout.get_notify_reduction_workspace_ptr() + i, counter);
    ```
 
    高 32 bit 记录到达的 SM 数，低 32 bit 记录计数值。
 
-3. **SM0 汇总并 all-to-all 计数**  
-   当 `status >> 32 == kNumSMs` 时，SM0 把归约结果编码，分别用 `gin.put_value`（rank 计数）和 `gin.put`（expert 计数 bulk）写到所有 peer 的接收区：
+3. **SM0 汇总并 all-to-all 计数**   
+   当 `status >> 32 == kNumSMs` 时，SM0 把归约结果编码写到所有 peer 的接收区：rank 计数用 `gin.put_value`；expert 计数在单节点（NVLink）场景下同样是**逐元素 `gin.put_value`**（`dispatch.cuh:162-170`），`gin.put` bulk 仅用于非 NVLink（RDMA）路径（`dispatch.cuh:172-177`）：
 
    ```cpp
-   // dispatch.cuh:151-177
+   // dispatch.cuh:152-178
    for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
        const auto dst_rank_counter =
            workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx;
@@ -254,11 +254,11 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
    }
    ```
 
-4. **等待 peer 计数**  
+4. **等待 peer 计数**   
    SM0 自旋等待 `scaleup_rank_expert_count_ptr<false>()[i]`，直到拿到所有 peer 发给本 rank 的 per-rank / per-expert 计数：
 
    ```cpp
-   // dispatch.cuh:184-200
+   // dispatch.cuh:185-201
    const auto count = static_cast<int>(
        ptx::ld_volatile<int64_t>(workspace_layout.get_scaleup_rank_expert_count_ptr<false>() + i));
    ```
@@ -267,7 +267,7 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
    对本地每个 expert，把所有 rank 发来的计数相加，并按 `expert_alignment` 对齐：
 
    ```cpp
-   // dispatch.cuh:204-214
+   // dispatch.cuh:205-220
    int sum = 0;
    for (int j = 0; j < kNumRanks; ++ j)
        sum += expert_count[j * kNumExpertsPerRank + i];
@@ -276,6 +276,8 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
    if (cumulative_local_expert_recv_stats != nullptr)
        atomicAdd(cumulative_local_expert_recv_stats + i, sum);
    ```
+
+   对齐之前，notify warp 会先把未对齐的真实每 expert 接收数写进 `num_unaligned_recv_tokens_per_expert`（EPHandle 字段，expand 模式下供确定性排序定位 expert 区间使用；`dispatch.cuh:212-213`、`hybrid_dispatch.cuh:283-284`、`elastic.py:86`）。
 
 6. **生成 prefix sum**  
    - `psum_num_recv_tokens_per_scaleup_rank`：对去重后的 `rank_count` 做 inclusive prefix sum，最后一个元素即本次 dispatch 本 rank 总共收到的 token 数。
@@ -287,7 +289,7 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
 |---|---|---|
 | `rank_count` | 共享内存 / workspace | 本 rank 发给每个 peer 的 **去重后** token 数 |
 | `expert_count` | 共享内存 / workspace | 本 rank 发给每个全局 expert 的 token 数（不去重） |
-| `cumulative_local_expert_recv_stats` | `[num_local_experts]`，可选 | 每个本地 expert 收到的总 token 数，用于负载均衡监控 / load balance loss（`elastic.py:743-744`） |
+| `cumulative_local_expert_recv_stats` | `[num_local_experts]`，可选 | 每个本地 expert 收到的总 token 数，用于负载均衡监控 / load balance loss（`elastic.py:891-892`） |
 | `psum_num_recv_tokens_per_scaleup_rank` | `[num_scaleup_ranks]` | 来自各 rank 的 token 在接收 buffer 中的 inclusive 偏移；最后一个元素为总接收 token 数 |
 | `psum_num_recv_tokens_per_expert` | `[num_local_experts]` | expand 模式下各 expert 在输出 buffer 中的 exclusive 偏移 |
 | `dst_buffer_slot_idx` | `[num_tokens, num_topk]` | 每个 `(token, top-k)` 在目标 rank 接收 buffer 中的 slot 索引，combine 反向路由的关键 |
@@ -295,19 +297,21 @@ int *expert_count = rank_expert_count + num_ranks;   // [num_ranks, num_ranks+nu
 `dst_buffer_slot_idx` 在普通模式下由 dispatch data warps 通过 `atomicAdd` 在 `scaleup_atomic_sender_counter` 上动态分配：
 
 ```cpp
-// dispatch.cuh:338-343
+// dispatch.cuh:344-350
 if (ptx::deduplicate(stored_dst_rank_idx, lane_idx) and stored_dst_rank_idx >= 0)
     stored_dst_slot_idx = atomicAdd(workspace_layout.get_scaleup_atomic_sender_counter() + stored_dst_rank_idx, 1);
 ```
 
-在 `deterministic` 或 `cached_mode` 下，它由 `dispatch_deterministic_prologue` 通过前缀和 **确定性预分配**，避免原子操作带来的不确定性。
+在 `cached_mode` 下，它直接复用 handle 中保存的 `dst_buffer_slot_idx`（`kReuseSlotIndices`，`dispatch.cuh:339-343`），发送端不再重新分配。
+
+而在 `deterministic` 模式下，`dst_buffer_slot_idx` **仍然由 dispatch kernel 内的原子操作分配**；确定性并非来自一个"预分配 prologue kernel"（仓库中并不存在此类 kernel），而是来自 dispatch 完成之后的 **Python 端事后排序**：`ElasticBuffer.dispatch` 在 `self.deterministic` 时会调用 `EPHandle.deterministic_sort`（`elastic.py:1021-1027`，实现在 `elastic.py:100-192`），按源 token 全局索引把输出重排成确定顺序，保证结果可复现（详见 §6.3）。
 
 ##### 4.2.1.5 Notify 与 NCCL GIN
 
 Notify 阶段的 all-to-all 计数交换走的就是 NCCL GIN：
 
 ```cpp
-// dispatch.cuh:153-157
+// dispatch.cuh:155-157
 gin.put_value<team_t>(workspace_layout.get_scaleup_rank_count_ptr<false>() + rank_idx,
                       static_cast<int64_t>(rank_count[i]), i,
                       ncclGinOptFlagsAggregateRequests);
@@ -344,7 +348,7 @@ Notify 看起来只是“数数”，但它在通信模式上是 **结构化的 
 
 ###### 为什么 notify 必须是 all-to-all
 
-在 `dispatch.cuh:151-157` 中，SM0 向 **所有 peer rank** 发送本 rank 的计数：
+在 `dispatch.cuh:152-158` 中，SM0 向 **所有 peer rank** 发送本 rank 的计数：
 
 ```cpp
 for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
@@ -366,7 +370,7 @@ for (int i = thread_idx; i < kNumRanks; i += kNumNotifyThreads) {
 Dispatch 的数据搬运只发生在 token 的 top-k 专家实际落到的那些 rank 上：
 
 ```cpp
-// dispatch.cuh:370-385
+// dispatch.cuh:373-377
 const auto dst_ptr = stored_dst_slot_idx >= 0 ?
     gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
     nullptr;
@@ -470,7 +474,7 @@ flowchart LR
 | **`do_cpu_sync=False`** | GPU 端按最大 buffer 异步分配，避免 CPU 等待 |
 | **`ncclGinOptFlagsAggregateRequests`** | 聚合多个 `put_value`，减少 doorbell 和 QP 头开销 |
 | **64-bit packed `red_add`** | 计数 + SM 到达计数一次 atomic 完成 |
-| **deterministic prologue** | 把 slot 分配从主 kernel 拆出，减少主 kernel 内串行时间 |
+| **deterministic 事后排序** | slot 分配不变，dispatch 完成后在 Python 端按源 token 索引重排输出，不增加 kernel 内串行时间 |
 
 ###### 能否让 notify 也变成稀疏的
 
@@ -511,6 +515,7 @@ flowchart LR
    - 非 expand 模式：按收到顺序直接写入 `recv_x[i]`。
    - expand 模式：按 expert 做 atomicAdd 到 `psum_num_recv_tokens_per_expert`，把同一 expert 的 token 紧凑排列，便于后续 GEMM。
 4. 同时生成 `recv_src_metadata[i, 0..num_topk+1]`，记录源 token 全局索引、源 rank 与 master top-k lane，供 combine 反向路由。
+5. 补充细节：dispatch kernel 以一次**初始 barrier** 开始（`kDispatchTag0`，`dispatch.cuh:74-76`），结尾清理 scale-up 原子计数器（`dispatch.cuh:405-408`），并以 **cluster dim 2** 启动（`dispatch.hpp:226`）。此外 dispatch / combine 均提供 `previous_event_before_epilogue` 参数，可在 epilogue kernel 启动前先等待指定事件（`buffer.hpp:1126-1127`、`1315-1316`）。
 
 ### 4.3 多节点 hybrid dispatch 流程
 
@@ -538,7 +543,7 @@ flowchart LR
 - 需要先统计跨 scale-out rank 的 token 数量。
 - 每个 scale-out rank 内再统计跨 scale-up rank 的数量。
 - 通过 `ncclTeamTagRail` 在 scale-out 域内交换计数，通过 `ncclTeamTagLsa` 在 scale-up 域内交换计数。
-- 使用 `red_add_rel` 做跨节点的原子 reduce，最终得到每个本地 expert 的接收数。
+- 跨节点（Rail 域）一跳是 `gin.put` 批量拷贝计数数组（`hybrid_dispatch.cuh:177-188`），而非原子 reduce；`red_add_rel` 用于节点内 LSA（scale-up）域，向目标 scale-up peer 的 expert 计数做原子加（`hybrid_dispatch.cuh:249-251`）。Rail 域的 `red_add_rel` 只用于 channel tail 信号（`hybrid_dispatch.cuh:347`、`hybrid_combine.cuh:593`）。
 
 #### 4.3.2 Scale-out warps
 
@@ -551,7 +556,7 @@ flowchart LR
 - 每个 channel 轮询所有 scale-out peer 的 `scaleout_channel_signaled_tail`。
 - 发现有新 token 后，TMA load 到 smem，解析 top-k 得到目标 scale-up rank。
 - 为每个目标 scale-up rank 在 scale-up buffer 中分配 slot，并记录 `token_metadata_at_forward`。
-- 通过 `channel_linked_list` 把同一 scale-up peer 的 token 连成链表，供 combine 阶段直接遍历。
+- forward warp 只把链表索引写进 token 元数据（`tma_buffer.get_linked_list_idx_ptr()`），并更新 workspace 中的 channel tail（`hybrid_dispatch.cuh:563-576`、`642-652`）；真正执行 `channel_linked_list[ll_idx] = i` 建链的是 copy epilogue（`dispatch_copy_epilogue.cuh:131-135`、`212-229`），建好的链表供 combine 阶段直接遍历。
 
 ---
 
@@ -565,7 +570,7 @@ flowchart LR
 
 - `x`: `[num_tokens, hidden]`，BF16，通常是专家计算后的输出。
 - `handle`: dispatch 返回的 `EPHandle`，包含 `src_metadata`、`topk_idx` 等。
-- `topk_weights`: `[num_tokens, num_topk]`，可选；非 expand 模式下用于最终加权。
+- `topk_weights`: `[num_tokens, num_topk]`（非 expand 模式）或 1D `[num_tokens]`（expand 模式，按 expand 后的槽位索引取值，`elastic.py:1064-1066`），可选；**两种模式下都用于最终加权归约**（`combine.cuh:216-224`、`hybrid_combine.cuh:304-315`）。
 - `bias_0` / `bias_1`: 可选输出 bias。
 
 **输出**：
@@ -582,8 +587,8 @@ flowchart TD
     B --> C["Combine warps 遍历 num_reduced_tokens"]
     C --> D["读取 src_metadata<br/>src_token_idx, src_rank_idx, src_topk_idx"]
     D --> E{"src_rank 是否本地 NVLink?"}
-    E -- 是 --> F["直接从远程对称地址 TMA load"]
-    E -- 否 --> G["从本地 RDMA send buffer TMA load"]
+    E -- 是 --> F["TMA store 写到目标 rank 的<br/>远程对称 recv buffer (push)"]
+    E -- 否 --> G["TMA store 写到本地 send buffer,<br/>再由源 rank 主动发起 gin.put (RDMA)"]
     F --> H{"expand + 多选?"}
     G --> H
     H -- 无需 reduce --> I["TMA store 到 master_token_buffer"]
@@ -603,20 +608,20 @@ flowchart TD
 2. 对第 $i$ 个 token，从 `src_metadata[i]` 解析：
    - `src_token_global_idx`：源 token 在全局 batch 中的索引。
    - `src_rank_topk_idx = src_rank_idx * num_topk + src_topk_idx`：标识源 rank 与 top-k 位置。
-3. 判断源 rank 是否 NVLink 可达：
-   - 可达：直接 `get_sym_ptr` 拿到远程对称地址，从该地址 TMA load。
-   - 不可达：从本地 send buffer 的对应位置读取（数据已由远端 RDMA PUT 写入）。
+3. combine 是 **push 模型**：本 rank 把本地专家输出写到目标 rank 的接收区。判断目标 rank 是否 NVLink 可达：
+   - 可达：直接 `get_sym_ptr` 拿到远程对称地址，把数据 TMA store 到目标 rank 的 recv buffer（`combine.cuh:194`）。
+   - 不可达：先把数据 TMA store 到本地 send buffer 的对应位置（`combine.cuh:201`），随后由本 rank（发送方）主动发起 `gin.put`，把 send buffer 内容写到目标 rank 的 recv buffer（`combine.cuh:206、230-234`）。send buffer 由发送方写入，并非"由远端 RDMA PUT 写入"；combine 全程不存在"从远端 TMA load"。
 4. 三种处理路径：
    - **非 expand 且无需 reduce**：直接把数据写到 `master_token_buffer`。
    - **expand 且 allow_multiple_reduction**：在共享内存中把同一源 token 的多个 top-k 结果累加，再写回。
    - **expand 且禁用多轮 reduce**：把每个 top-k 结果分别发回源 rank 的不同 slot。
 5. 若提供 `topk_weights`，把权重写入 token buffer 的 metadata 区，供 reduce epilogue 使用。
-6. 对 RDMA 路径，等待 TMA store 完成后发起 `gin.put`。
+6. 对 RDMA 路径，等待 send buffer 的 TMA store 完成后，由源 rank 主动发起 `gin.put`（`combine.cuh:230-234`）。
 7. 结束 barrier 等待所有数据到达。
 
 #### 5.2.2 Reduce epilogue
 
-`combine_reduce_epilogue` kernel 通过 PDL 在 main combine kernel 完成后启动：
+`combine_reduce_epilogue` kernel 以 **PDL（programmatic launch）方式启动并靠 `cudaGridDependencySynchronize()` 阻塞**，直到 main combine kernel 完成且数据可见（`combine_reduce_epilogue.cuh:57-59`、`combine.hpp:282`）；PDL 的目的是让 epilogue 的启动阶段与 main kernel 重叠，而非"main 完成后才启动"。注意主 combine kernel 并未调用 `cudaTriggerProgrammaticLaunchCompletion`（与 dispatch 侧不同，`dispatch.cuh:403`）：
 
 1. 对每个输出 token `t`（`0..num_combined_tokens-1`），读取 `combined_topk_idx[t]` 得到目标专家。
 2. 根据目标专家确定需要 reduce 的源 rank / slot（使用 `kUseRankLayout` 或 `kUseTopkLayout`）。
@@ -628,23 +633,23 @@ flowchart TD
 
 Combine 是 dispatch 的逆过程，同样分 scale-up 与 scale-out 两跳：
 
-1. **Scale-up warps**：读取 `channel_linked_list`，遍历本节点内各 scale-up rank 需要 reduce 的 token；在本地 scale-up buffer 中完成 reduce 后，把结果发到 scale-out send buffer。
-2. **Forward warps**：把 scale-out send buffer 中的 token 经 RDMA PUT 发回源 scale-out rank。
-3. 源 scale-out rank 的 scale-up warps 再把数据 forward 到最终目标 rank（如果需要）。
+1. **Scale-up warps**：读取 `channel_linked_list`，遍历需要 reduce 的 token；经 NVLink TMA store 把数据写到目标 scale-up rank 的 scale-up buffer，并更新 `channel_scaleup_tail`（`hybrid_combine.cuh:318-332`）。
+2. **Forward warps**：做跨 scale-up 归约，把结果写入 scale-out send buffer（`hybrid_combine.cuh:495-571`），再经 RDMA PUT 发回源 scale-out rank。
+3. 源 scale-out rank 上的最终归约由独立的 **`combine_reduce_epilogue` kernel** 完成（`buffer.hpp:1316-1329`），而非 combine kernel 的 scale-up warp。
 
 ```mermaid
 flowchart RL
     subgraph DstNode["目标节点"]
         direction TB
-        DGPU1["GPU 1 (scale-up warp)<br/>reduce in scale-up buffer"]
-        DGPU0["GPU 0 (forward warp)"]
+        DGPU1["GPU 1 (scale-up warp)<br/>NVLink TMA store 写 scale-up buffer<br/>更新 channel_scaleup_tail"]
+        DGPU0["GPU 0 (forward warp)<br/>跨 scale-up 归约<br/>写 scale-out send buffer"]
     end
     subgraph SrcNode["源节点"]
         SGPU["GPU src"]
     end
-    DGPU1 -->|"NVLink TMA store<br/>scale-out send buffer"| DGPU0
-    DGPU0 -->|"RDMA PUT"| SGPU
-    SGPU -->|"NVLink / 本地 reduce<br/>得到 combined_x"| SGPU
+    DGPU1 -->|"NVLink TMA store<br/>scale-up buffer"| DGPU0
+    DGPU0 -->|"RDMA PUT<br/>scale-out send buffer"| SGPU
+    SGPU -->|"combine_reduce_epilogue 归约<br/>得到 combined_x"| SGPU
 ```
 
 ---
@@ -661,6 +666,8 @@ flowchart RL
 - `recv_src_metadata`：每个收到 token 的源信息。
 - `dst_buffer_slot_idx`、`token_metadata_at_forward`、`channel_linked_list`：hybrid 模式专用。
 
+注意 `dst_buffer_slot_idx` 的形状：单节点为 `[num_tokens, num_topk]`；hybrid 模式实际为 `[num_channels, num_scaleout_ranks, num_max_tokens_per_channel, num_topk]`（`buffer.hpp:901-904`）。
+
 在推理解码阶段，如果 gate 决策不变，可直接把上一次的 `EPHandle` 传入下一次 `dispatch`，跳过 notify / prefix sum 等 CPU 同步，显著降低 latency。
 
 ### 6.2 CPU sync 与无 CPU sync
@@ -668,20 +675,23 @@ flowchart RL
 - **CPU sync（`do_cpu_sync=True`）**：dispatch kernel 把 rank/expert 计数写到 host-mapped workspace，CPU 轮询直到拿到精确接收数，再分配 `recv_x` 等输出 tensor。优点是输出尺寸精确；缺点是需要 CPU 等待 GPU，无法与 CUDA graph 一起使用。
 - **无 CPU sync**：直接按 `num_max_tokens_per_rank * num_ranks` 的最大值分配输出，copy epilogue 再根据 GPU 上的 prefix sum 实际填充。优点是可完全异步；缺点是 buffer 空间浪费。
 
-### 6.3 Deterministic prologue
+另外，`ElasticBuffer` 构造时可传 `explicitly_destroy=True`，此后需要显式调用 `destroy()` 释放 C++ runtime 与 NCCL communicator（`elastic.py:369-378`）；默认则由析构函数隐式释放。
 
-当 `deterministic=True` 且单节点时，DeepEP 会先启动一个独立的 `dispatch_deterministic_prologue` kernel：
+### 6.3 Deterministic 事后排序
 
-- 预先遍历所有 token 的 `topk_idx`。
-- 为每个 `(token, top-k)` 分配确定性的 `dst_buffer_slot_idx`。
-- 避免 dispatch 主 kernel 中跨 warp 的原子竞争，保证结果可复现。
+当 `deterministic=True` 时（单节点与 hybrid 模式均适用），`dst_buffer_slot_idx` 本身仍由 dispatch kernel 原子分配；确定性由 **dispatch 完成后的 Python 端排序** 实现：`ElasticBuffer.dispatch` 在 `self.deterministic` 时调用 `EPHandle.deterministic_sort`（调用点 `elastic.py:1021-1027`，实现在 `elastic.py:100-192`）：
+
+- **非 expand 模式**：按 `cached_recv_src_metadata` 中的源 token 全局索引，对 `recv_x` / `recv_sf` / `recv_topk_weights` / `recv_topk_idx` / `recv_src_metadata` 整体做 permute（cached dispatch 不重新生成 `recv_src_metadata`，故仅非 cached 时 permute 它）。
+- **expand 模式**：仅在各 expert 区间内部重排 `recv_x` / `recv_sf` / `recv_topk_weights`，并相应更新 `recv_src_metadata[:, 2:]` 中的槽位指针。
+- `do_cpu_sync=False` 时，越界（OOB）token 的 sort key 被置为最大值，从而排到末尾被忽略。
+- hybrid 模式下还会同时重映射 `channel_linked_list` 的链表索引。
 
 ### 6.4 Expand mode
 
 - **非 expand**：每个 token 在 recv buffer 中保留 $k$ 个 slot，排列为 `[num_recv_tokens, num_topk]`。
 - **expand**：每个 `(token, expert)` 对占用独立一行，`recv_x` 形状为 `[num_expanded_tokens, hidden]`，同一 expert 的 token 在内存中连续，可直接作为专家 GEMM 的输入。
 
-Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现。
+Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现。此外 `dispatch` 还接受 `do_zero_padding` 参数：expand 模式下把 expert 对齐引入的 padding 槽位清零（`elastic.py:872`、`buffer.hpp:731`），由 copy epilogue 实现（`dispatch_copy_epilogue.cuh:232-322`）。
 
 ### 6.5 Multiple reduction
 
@@ -702,9 +712,11 @@ Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现�
 
 `comm::gpu_barrier` 统一处理三类 barrier：
 
-- **NVLink barrier**：通过共享内存中的原子计数器与信号数组，单 SM 即可完成。
+- **NVLink barrier**：使用 **workspace 对称内存**中的原子计数器与信号数组（`get_nvl_barrier_counter_ptr` / `get_nvl_barrier_signal_ptr` 均由 workspace 指针偏移得到，`comm.cuh:82-105`），不是共享内存；单 SM 即可完成。
 - **Gin barrier**：对所有 QP flush 后，用 NCCL Gin `signal` / shadow counter 等待全部 peer 到达。
 - **Hybrid barrier**：SM0 负责 scale-up 子域 barrier，其余 SM 负责 scale-out 子域 barrier，通过 grid sync 协调。
+
+Python 侧的 `ElasticBuffer.barrier(use_comm_stream, with_cpu_sync, sequential)` 还有一个 `sequential` 参数：控制 scale-out 与 scale-up 两级 barrier 串行（单 SM）还是并行执行，串行模式提供更强的同步保证，主要用于测试同步（`elastic.py:497-508`、`comm.cuh:214-270`）。
 
 ### 6.8 QP 与 channel 映射
 
@@ -713,6 +725,15 @@ Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现�
 - 若 `num_sms <= num_qps`：每个 SM 独占若干 QP，channel 在 SM 内轮询 QP。
 - 否则：所有 SM 共享 QP，按全局 channel 索引取模。
 - notify warps 固定使用 QP 0 与 `NCCL_GIN_RESOURCE_SHARING_CTA` 模式。
+
+### 6.9 相关环境变量
+
+- `EP_OVERRIDE_RDMA_SL`：覆盖 RDMA service level（`sl_idx`）的取值（`elastic.py:323-324`）。
+- `EP_NUM_MAX_LOCAL_RANKS`：hybrid 模式下每节点的最大本地 rank 数（默认 16，`elastic.py:288`）。
+- `NCCL_WIN_STRIDE`：由 DeepEP 在初始化时根据 symmetric window 大小自动设置，供 NCCL 使用（`elastic.py:296-298`）。
+- `NCCL_GIN_CROSS_NIC`：设为 `0` 时走多平面/sysmem handle 复用的初始化分支（`elastic.py:279-281`）。
+- `EP_BUFFER_DEBUG`：打开 buffer 与 SM 近似等调试打印（`elastic.py:311、828`，以及 `nccl.cu`、`buffer.hpp` 多处）。
+- `EP_AVOID_RECORD_STREAM`：设为非 0 时，事件记录张量时不调用 `record_stream`（仅作用于 V2 API，`buffer.hpp:566`）。
 
 ---
 
@@ -725,13 +746,15 @@ Expand 模式通过 `psum_num_recv_tokens_per_expert` 做 atomic scatter 实现�
 1. 根据 gate 分布计算期望的跨 scale-up / scale-out top-k 数量。
 2. 分别估算 HBM read、HBM write、RDMA traffic、NVLink traffic。
 3. 找出瓶颈链路，按 `bounded_gbs / bounded_traffic` 与 SM 读写能力计算所需 SM。
-4. 最终向上对齐到不小于 4 的偶数，并受 `prefer_overlap_with_compute` 影响。
+4. 最终 `num_sms = align(max(4, ceil(num_sms * 1.25)), 2)`；且 `prefer_overlap_with_compute=False` 时先取 `max(num_sms, 64)`（`elastic.py:823-824`）。
 
 ### 7.2 理论 QP 数
 
-- 单节点 direct 模式：`min(num_sms, 8) + 1`（含 notify QP）。
-- 多节点 hybrid 模式：`num_sms * 16 + 1`。
-- 最终不超过 `num_allocated_qps`（默认 direct 17，hybrid 65/129）。
+- direct 模式：`num_qps = min(num_sms, 8 + 1)`，即 `min(num_sms, 9)`（`elastic.py:847`）。
+- hybrid 模式：`num_qps = num_sms * 16 + 1`。注意其启用条件是构造标志 `allow_hybrid_mode`（默认 `True`，`elastic.py:850`）——单节点 buffer 只要该标志为 True 同样走此式，并非运行时的"多节点"判定。
+- 最终不超过 `num_allocated_qps`（默认 direct 17，hybrid 65/129，`elastic.py:331-334`）。
+
+此外，`ElasticBuffer` 还提供一组静态工具方法，用于在构造前估算各类 buffer 尺寸：`get_buffer_size_hint`、`get_engram_storage_size_hint`、`get_pp_buffer_size_hint`、`get_agrs_num_max_session_bytes` / `get_agrs_buffer_size_hint`（`elastic.py:380-495`）。
 
 ---
 
@@ -741,7 +764,7 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
 
 1. **统一 ElasticBuffer**：一套 API 覆盖高吞吐训练/预填与低延迟解码。
 2. **两层拓扑感知**：scale-up（NVLink）与 scale-out（RDMA）分层路由，hybrid 模式支持跨节点高效转发。
-3. **极致硬件利用**：TMA、mbarrier、PDL、inline PTX 把 SM 占用压到最低（V2 相比 V1 最多减少 4x SM）。
+3. **极致硬件利用**：TMA、mbarrier、PDL、inline PTX 把 SM 占用压到最低（README 口径："SM usage reduced from 24 to 4-6"，即约 4~6x；此为性能声明，代码本身无法验证）。
 4. **全 JIT + 解析式调参**：无需离线 tuning，安装简单。
 5. **丰富的精度与模式**：BF16 / FP8、expand / non-expand、multiple reduction、CPU sync / async、handle 缓存。
 
@@ -825,8 +848,8 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
     B --> C[\"Combine warps 遍历 num_reduced_tokens\"]
     C --> D[\"读取 src_metadata<br/>src_token_idx, src_rank_idx, src_topk_idx\"]
     D --> E{\"src_rank 是否本地 NVLink?\"}
-    E -- 是 --> F[\"直接从远程对称地址 TMA load\"]
-    E -- 否 --> G[\"从本地 RDMA send buffer TMA load\"]
+    E -- 是 --> F[\"TMA store 写到目标 rank 的<br/>远程对称 recv buffer (push)\"]
+    E -- 否 --> G[\"TMA store 写到本地 send buffer,<br/>再由源 rank 主动发起 gin.put (RDMA)\"]
     F --> H{\"expand + 多选?\"}
     G --> H
     H -- 无需 reduce --> I[\"TMA store 到 master_token_buffer\"]
@@ -846,15 +869,15 @@ DeepEP V2 通过以下设计，把 MoE EP 通信从“黑盒 all-to-all”提升
 "flowchart RL
     subgraph DstNode[\"目标节点\"]
         direction TB
-        DGPU1[\"GPU 1 (scale-up warp)<br/>reduce in scale-up buffer\"]
-        DGPU0[\"GPU 0 (forward warp)\"]
+        DGPU1[\"GPU 1 (scale-up warp)<br/>NVLink TMA store 写 scale-up buffer<br/>更新 channel_scaleup_tail\"]
+        DGPU0[\"GPU 0 (forward warp)<br/>跨 scale-up 归约<br/>写 scale-out send buffer\"]
     end
     subgraph SrcNode[\"源节点\"]
         SGPU[\"GPU src\"]
     end
-    DGPU1 -->|\"NVLink TMA store<br/>scale-out send buffer\"| DGPU0
-    DGPU0 -->|\"RDMA PUT\"| SGPU
-    SGPU -->|\"NVLink / 本地 reduce<br/>得到 combined_x\"| SGPU"
+    DGPU1 -->|\"NVLink TMA store<br/>scale-up buffer\"| DGPU0
+    DGPU0 -->|\"RDMA PUT<br/>scale-out send buffer\"| SGPU
+    SGPU -->|\"combine_reduce_epilogue 归约<br/>得到 combined_x\"| SGPU"
 ```
 
 ### A.6 Notify 阶段详细流程
