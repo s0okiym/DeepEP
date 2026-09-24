@@ -1,7 +1,7 @@
 # DeepEP V2.5 详解:架构重构、通信内核与新增能力
 
 > **分析对象**: `v2.5` 分支,tip commit `8c1d13a`(2026-09-23,`remove warpget opt`),版本号 `2.5.0`
-> **对比基线**: `epv2-release` 分支,tip commit `76f1427`(V2.0,`DeepEP V2` 的 elastic 形态)
+> **对比基线**: 基线 commit `76f1427`(V2.0 公开前快照,version 2.0.0:`DeepEP V2` 的 elastic 形态,含 V1 legacy、自带构建期 JIT 与 NVSHMEM 依赖)
 > **方法**: 基于两个 commit 的完整代码阅读(全部 16 个增量提交、162 个变更文件),文中所有结论均标注代码出处
 > **分析日期**: 2026-09-24
 
@@ -40,23 +40,24 @@
 | 变更文件数 | 162 个 |
 | 新增 / 删除行数 | +12,612 / −17,445 |
 | 核心提交 | `1a1ffba DeepEP V2.5`(单次 squash 了 Nightly 仓库相对公开 main 的 **534 个提交**) |
-| 删除的主要代码 | `csrc/kernels/legacy/`(约 7,000 行 V1 内核)、`csrc/legacy/`(1,794 行 V1 Buffer)、`csrc/elastic/`(1,307 行 ElasticBuffer)、`csrc/jit/`(约 1,000 行自带 JIT)、`deep_ep/buffers/{legacy,elastic}.py` |
-| 新增的主要代码 | `csrc/buffers/`(四个专用 Buffer 共约 2,150 行)、`deep_ep/buffers/{ep,bucket,engram,pp}.py`(约 1,600 行)、`deep_ep/include/deep_ep/impls/bucket/`(约 1,770 行 kernel)、`csrc/kernels/{comm,ep,bucket,engram,pp}/`(内核启动层) |
+| 删除的主要代码 | `csrc/kernels/legacy/`(约 7,000 行 V1 内核)、`csrc/legacy/`(1,984 行 V1 Buffer,其中 `buffer.hpp` 恰为 1,794 行)、`csrc/elastic/`(1,307 行 ElasticBuffer)、`csrc/jit/`(786 行、8 个头文件的自带 JIT)、`deep_ep/buffers/{legacy,elastic}.py` |
+| 新增的主要代码 | `csrc/buffers/`(BufferBase + 四个专用 Buffer 共 2,004 行)、`deep_ep/buffers/{ep,bucket,engram,pp}.py`(1,545 行)、`deep_ep/include/deep_ep/impls/bucket/`(约 1,770 行 kernel)、`csrc/kernels/{comm,ep,bucket,engram,pp,driver}/`(内核启动层,`driver.cpp` 所在) |
 
 ### 1.3 提交时间线
 
-V2.0(4 月底 EPv2 公开)到 V2.5 的 16 个增量提交可分为三段:
+V2.0(4 月底 EPv2 公开)到 V2.5 的 16 个增量提交可分为四段:
 
 | 阶段 | 时间 | 提交 | 内容 |
 |---|---|---|---|
-| EPv2 修复期 | 04-30 ~ 08-04 | `b306af0` ~ `01dc3aa`(12 个) | EPv2 公开发布后的稳定性修复:单节点初始化(`#630`)、NCCL Device API 运行时版本兼容(`#688`)、跨 NVLink+RDMA scale-up 域时 GIN barrier 前的 system-scope release(`#715`)、mbarrier 与 TMA load 之间的 `fence.proxy.async.shared::cta`(`#642`)、doorbell 时序(`#752`)等 |
+| EPv2 修复期 | 04-30 ~ 08-04 | `b306af0` ~ `01dc3aa`(13 个) | EPv2 公开发布后的稳定性修复:单节点初始化(`#630`)、NCCL Device API 运行时版本兼容(`#688`)、跨 NVLink+RDMA scale-up 域时 GIN barrier 前的 system-scope release(`#715`)、mbarrier 与 TMA load 之间的 `fence.proxy.async.shared::cta`(`#642`)等 |
+| 插入修复 | 09-16 | `a56d615 Ensure that the last get rings the doorbell`(`#752`) | Engram fetch doorbell 时序修复:最后一批 get 必须敲 doorbell,否则 flush 不完整(见 §8.2);该提交夹在 `01dc3aa` 与 `1a1ffba` 之间,日期在修复期区间之外 |
 | V2.5 主干 | 09-23 | `1a1ffba DeepEP V2.5` | 一次 squash 合并 Nightly 仓库 534 个提交,即本文分析的绝大部分:四 Buffer 拆分、DeepJIT、删 V1/删 NVSHMEM、LB 原语、Bucket 集合通信、多层 Engram |
 | 收尾 | 09-23 | `8c1d13a remove warpget opt` | 移除 Engram fetch 中的 `ncclGinOptFlagsWarpGet` 优化路径(该优化依赖扩展版 NCCL 构建,移除后 Engram 对特殊 NCCL 构建的依赖解除) |
 
 ### 1.4 版本演进脉络
 
 ```
-V1.x (legacy, 1.2.1)          V2.0 (epv2-release)           V2.5 (v2.5 分支)
+V1.x (legacy, 1.2.1)          V2.0 (76f1427)                V2.5 (v2.5 分支)
 ─────────────────────         ─────────────────────         ─────────────────────
 Buffer (V1 API)               ElasticBuffer                 EPBuffer        MoE dispatch/combine
   + NVSHMEM 后端                (EP + Engram + PP            EngramBuffer    远程记忆 (多层, GPU/CPU 存储)
@@ -133,9 +134,11 @@ V2.5 的通信内存全部基于 **NCCL 对称内存窗口(symmetric window)**:�
 | `kNumTMAAlignmentBytes` | 32 B | TMA 指令对齐(V2.0 为 16 B,收紧) |
 | `kNumRDMAAlignmentBytes` | 64 B | RDMA 传输单元对齐 |
 | `kNumAllocationAlignmentBytes` | 2 MiB | 对称分配粒度(BufferAllocator 的对齐基准) |
-| `kNumMaxRanks` | 1024 | scale-out/scale-up/RDMA/NVLink rank 数统一上限(V2.0 各通道上限不同) |
+| `kNumMaxRanks` | 1024 | scale-out/scale-up/RDMA/NVLink rank 数统一上限 |
 | `kNumMaxContexts` / `kNumMaxQPs` / `kDefaultQPDepth` | 8 / 1024 / 1024 | GIN 上下文(QP)体系 |
 | `kNumMaxSignalBytes` | 16 MiB | 信号工作区上限 |
+
+另一个容量上限变化:`kNumMaxExpertsPerRank`(每 rank 专家数)从 V2.0 的 256(`common/layout.cuh:21`)放宽到 V2.5 的 512(`layout/ep/workspace.cuh:11`),单 rank 可承载更多专家。
 
 **`BufferAllocator` 的"规划—物化"模式**(§3.3)让多个张量(通信 buffer、LB 区、storage 等)先以 meta tensor 规划布局,再一次性物化到同一段连续、2 MiB 对齐的对称存储中——这是四个 buffer 共享内存管理的基础设施。
 
@@ -261,7 +264,7 @@ V1 的跨节点通信(含 IBGDA)与 V2.0 的 legacy 路径都依赖 NVSHMEM;EPv2
 
 1. 所有 device 侧 RDMA 操作(get/put/signal/flush)都有 Gin 对应原语;
 2. QP 数量、QP depth、RD atomic 限制等调参项改由 NCCL 环境变量/构造参数承载(如 `NCCL_GIN_GDAKI_MAX_QP_RD_ATOMIC`);
-3. 于是 NVSHMEM 相关的构建探测(`nvidia-nvshmem` pip 包)、`third-party/nvshmem.patch`、`NVSHMEM_*` 环境变量体系全部删除,**NVSHMEM 不再是依赖**(README News 与 `setup.py` 均无 NVSHMEM 痕迹)。
+3. 于是 NVSHMEM 相关的构建探测(`nvidia-nvshmem` pip 包,`setup.py`)、`csrc/kernels/backend/nvshmem.cu`、`NVSHMEM_*` 环境变量体系全部删除,**NVSHMEM 不再是依赖**(README News 与 `setup.py` 均无 NVSHMEM 痕迹)。
 
 ---
 
@@ -272,7 +275,7 @@ V1 的跨节点通信(含 IBGDA)与 V2.0 的 legacy 路径都依赖 NVSHMEM;EPv2
 | | V2.0 | V2.5 |
 |---|---|---|
 | GPU 内核编译时机 | 构建期(自带 `csrc/jit/` JIT 在首次调用时编译,但 host 扩展本身在 install 时用 torch cpp_extension 全量编译 CUDA 源) | **install 时完全不编 GPU 内核**;运行时由 DeepJIT 编译 |
-| JIT 实现 | 自带(`csrc/jit/{compiler,cache,kernel_runtime,launch_runtime,...}`,约 1,000 行) | 独立库 **DeepJIT**(`third-party/deep_jit` submodule → `deepseek-ai/DeepJIT`) |
+| JIT 实现 | 自带(`csrc/jit/{compiler,cache,kernel_runtime,launch_runtime,...}`,786 行、8 个头文件) | 独立库 **DeepJIT**(`third-party/deep_jit` submodule → `deepseek-ai/DeepJIT`) |
 | 安装前置 | 需要可见 GPU + `TORCH_CUDA_ARCH_LIST` | **不需要 GPU、不需要 arch list**;只需 CUDA toolkit(≥13.1)与 C++20 编译器可用 |
 | host 扩展源文件 | 多个 .cu/.cpp | 仅 3 个:`python_api.cpp`、`kernels/comm/context.cpp`、`kernels/driver/driver.cpp` |
 
@@ -400,7 +403,7 @@ SM 数估算 `lb_get_theoretical_num_sms` 只依赖带宽:`ceil(max(nvlink_gbs/s
 
 | 算子 | nvlink 传输 | rdma 传输 | hybrid 传输 |
 |---|---|---|---|
-| `all_gather` | 对称指针直读 + **copy engine** 驱动(`num_sms=0`,不占 SM) | 拷贝引擎 | 拷贝引擎 |
+| `all_gather` | 对称指针直读 + **copy engine** 驱动(`num_sms=0`,不占 SM) | **JIT 编译 `rdma_all_gather` 内核并 cooperative launch**(grid = 全部设备 SM) | **每 RDMA peer 1 SM 发射 RDMA**(`kNumQPsPerChunk` 个 QP)+ 拷贝引擎经 NVLink 转发到达的 chunk |
 | `reduce_scatter` | warp 读邻居槽 + 本地归约 | **credit-ring 双角色 warp**(§7.3) | 两级:NVLink 域内归约 + 跨节点 ring |
 | `all_reduce` | multimem(节点内硬件归约) | 本地归约 + 点对点 | **multimem + 跨节点 ring + 广播**三阶段(§7.4) |
 
@@ -535,8 +538,8 @@ from deep_ep import (
 | GPU | Ampere(Hopper 推荐) | **仅 Hopper 及以后**(SM90 特性不再可选,`DISABLE_SM90_FEATURES` 删除) |
 | CUDA toolkit | 12.x | **13.1+**(DeepJIT 编译需要,安装时可用、运行机需保留) |
 | 编译器 | C++17 | **C++20**(需 `std::format`) |
-| PyTorch | 2.1+ | **2.10+** |
-| NCCL | 2.27+ | **2.32.3+**(Gin 完整特性;`ncclDevCommCreate` 运行时版本兼容,`#688`) |
+| PyTorch | 2.10+ | **2.10+**(未变化) |
+| NCCL | 2.30.4+ | **2.32.3+**(Gin 完整特性;`ncclDevCommCreate` 运行时版本兼容,`#688`) |
 | NVSHMEM | 跨节点必需 | **彻底移除** |
 | 网络 | NVLink + RDMA | NVLink + RDMA;`BucketBuffer` 要求 NVLink 与 RDMA 带宽**都能被探测到**(`nvidia-smi`/`ibstat`),即便只用单传输 |
 | 安装 | 需 GPU + arch list | **免 GPU**;`git submodule update --init`(DeepJIT)+ `bash install.sh` |
@@ -549,10 +552,10 @@ from deep_ep import (
 ## 12. 被移除的功能与迁移说明
 
 1. **V1 全部删除**:`Buffer`/`Config`/`EventOverlap(V1 语义)` API、`kernels/legacy/` 的 intranode/internode/low-latency 内核(约 7,000 行)、`csrc/legacy/`、`docs/legacy.md` 对应的旧文档。仍在用 V1 的用户需升级到 EPv2 语义:`Buffer.get_dispatch_layout + dispatch` → `EPBuffer.dispatch`(布局计算内置,handle 化);low-latency 路径并入 `EPBuffer` 的统一接口(低延迟 = 小 batch 下的同一组内核)。
-2. **NVSHMEM 后端删除**:所有 `NVSHMEM_*` 环境变量、`ibgda_device.cuh`、`third-party/nvshmem.patch` 消失;等价能力由 `NCCL_GIN_GDAKI_*` 承担。
+2. **NVSHMEM 后端删除**:所有 `NVSHMEM_*` 环境变量、`csrc/kernels/legacy/ibgda_device.cuh`、`csrc/kernels/backend/nvshmem.cu`、`docs/nvshmem.md` 消失;等价能力由 `NCCL_GIN_GDAKI_*` 承担。
 3. **自带 JIT 删除**:`csrc/jit/` 整体移除,换 DeepJIT;依赖旧 JIT 缓存路径的用户改 `EP_JIT_CACHE_DIR`。
 4. **Ampere 支持删除**:FP8/SM90 路径成为硬依赖。
-5. **zero-SM EP 不可用**:EP 通信必须给 SM(Bucket 的 all_gather 除外,走拷贝引擎)。
+5. **zero-SM EP 不可用**:EP 通信必须给 SM(Bucket 的 all_gather 除外——且仅纯 NVLink 拓扑走拷贝引擎,RDMA/hybrid 拓扑仍需 SM 发射内核)。
 
 ---
 
@@ -601,7 +604,7 @@ V2.5 的测试目录按 buffer 重组(`tests/`):
 - `Bucket/Engram/PP` 在 README 中仍标注 **experimental**,生产使用应以 EPBuffer 为准;
 - README Notes 关于 Engram 依赖 `ncclGinOptFlagsWarpGet` NCCL 构建的说明,在 `8c1d13a` 之后已过时;
 - `EPBuffer.get_theoretical_num_sms` 的 docstring 明确:group-limited gate(如 V3.0)的负载分布不满足"平衡 gate"假设,估算函数不适配(TODO 保留);
-- Engram fetch 中 `tma_load_1d` 带 `L2CacheHint::kEvictNormal` 处留有 `TODO: why this is faster?`,说明部分性能选择仍属经验性结论。
+- LB 梯度归约内核(`impls/ep/reduce_grads.cuh:77-78`)中 `tma_load_1d` 带 `L2CacheHint::kEvictNormal` 处留有 `TODO: why this is faster?`,说明部分性能选择仍属经验性结论。
 
 ---
 
