@@ -70,6 +70,8 @@ DeepEP 选择 Gin 而非 legacy NVSHMEM 的原因：
 3. **更现代**：与 NCCL 的 scale-up / scale-out team 抽象天然对齐。
 4. **QP 可控**：可通过 `ncclDevCommRequirements_t` 显式指定 QP 数量、深度、traffic class。
 
+补充：NVSHMEM 后端代码仍保留在仓库中（`csrc/kernels/backend/nvshmem.cu` 与 `csrc/legacy/`），服务 V1 legacy 路径。
+
 ### 2.2 DeepEP 对 Gin 的初始化配置
 
 在 `NCCLSymmetricMemoryContext` 构造函数中：
@@ -88,6 +90,8 @@ ncclDevCommCreate(comm, &reqs, &dev_comm);
 
 - **full connection**：每个 rank 与所有 rank 建立 QP，适用于单节点或小规模。
 - **rail connection**：每个 rank 只与同 rail 的远端 rank 建立 QP，适用于 multi-plane / multi-rail 网络，可减少 QP 总数并提升路由局部性。
+- NCCL ≥ 2.31 时设置 `reqs.useRuntimeVersion = true`，并按 `props.devCommRuntimeVersionSize` 分配 `dev_comm`；更老版本要求编译期与运行期 NCCL 版本一致（nccl.cu:100-106）。
+- QP 深度常量：`kGinQPDepth = 1024`，另有 `kGinQPFlushDepth = 768` 用于 Engram fetch 的聚合 flush（common/compiled.cuh:84-85）。
 
 ### 2.3 核心原语映射
 
@@ -97,7 +101,7 @@ DeepEP 在 `common/handle.cuh` 中封装了 `NCCLGin` 结构，把 NCCL Gin 的 
 |---|---|---|
 | `put<team_t>()` | `gin.put()` | 把本地 send buffer 的连续数据 PUT 到远端 recv buffer。 |
 | `put_value<team_t>()` | `gin.putValue()` / `st_relaxed_sys` | 向远端写一个标量值；NVLink 可达时直接 store。 |
-| `red_add_rel<team_t>()` | `red_add_rel_sys` / `gin.signal(VASignalAdd)` | 对远端地址做原子加，用于计数器 reduce。 |
+| `red_add_rel<team_t>()` | `red_add_rel_gpu` / `red_add_rel_sys` / `gin.signal(VASignalAdd)` | 对远端地址做原子加，用于计数器 reduce；Rail team 或本地目标走 device 域原子 `red_add_rel_gpu`，其余 NVLink 可达目标走 `red_add_rel_sys`，RDMA 路径才是 `gin.signal(VASignalAdd)`。 |
 | `get<team_t>()` | `gin.get()` | 从远端拉取数据到本地（Engram fetch）。 |
 | `signal<team_t>()` | `gin.signal()` | 向远端发送一个信号（barrier / notify）。 |
 | `flush()` | `gin.flush()` | 强制刷出所有未完成请求。 |
@@ -113,7 +117,7 @@ NCCL Gin 通过 `team_t` 区分通信范围：
 
 - **`ncclTeamTagWorld`**：所有 rank。用于单节点 direct 模式下的 RDMA PUT（此时所有 rank 在同一 RDMA 域或 GPUDirect RDMA 可达）。
 - **`ncclTeamTagLsa`**：Local Shared Addressing，即同一 NVLink 域内的 GPU。用于 scale-up 域内的对称内存访问。
-- **`ncclTeamTagRail`**：同 rail 的 rank，通常对应跨节点的同一 NVLink switch / 同一 NIC plane。用于 hybrid 模式下的 scale-out 通信。
+- **`ncclTeamTagRail`**：同 rail 的 rank，对应跨节点的同一 NIC plane（rail 是 NIC plane 概念，代码中并无 NVLink switch 的对应物）。用于 hybrid 模式下的 scale-out 通信。
 
 ```mermaid
 flowchart TB
@@ -216,12 +220,13 @@ flowchart LR
 ### 4.3 窗口注册与地址转换
 
 ```cpp
-NCCL_CHECK(ncclCommWindowRegister(comm, raw_window_ptr, num_bytes, &window, NCCL_WIN_DEFAULT));
+NCCL_CHECK(ncclCommWindowRegister(comm, raw_window_ptr, this->symmetric_memory->num_bytes, &window, NCCL_WIN_STRICT_ORDERING));
 NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, nvl_rank_idx, &mapped_window_ptr));
 ```
 
 - `raw_window_ptr` 是 symmetric memory 的起始地址。
 - `window` 是 NCCL 注册的通信窗口。
+- 注册大小是 symmetric memory 的全量 `num_bytes`（GPU + CPU；Hybrid 下 CPU 段按 `num_scaleup_ranks` 份映射），而非构造时传入的用户 `num_bytes` 参数；flag 为 `NCCL_WIN_STRICT_ORDERING`。
 - `mapped_window_ptr` 是本 rank 在该窗口中的 LSA 指针。
 - 对 NVLink peer：`get_sym_ptr(ptr, dst_rank) = nvl_window_ptrs[dst_rank] + offset`。
 - 对 RDMA peer：Gin 使用 `reinterpret_cast<int64_t>(ptr) - lsa_base_ptr` 作为 VAS 偏移。
@@ -238,9 +243,7 @@ NCCL_CHECK(ncclGetLsaDevicePointer(window, 0, nvl_rank_idx, &mapped_window_ptr))
 
 1. 计算 recv / send 指针在 NCCL window 内的偏移。
 2. 通过 `team_t` 选择 `team_world` 或 `team_rail`。
-3. NCCL Gin 内部根据目标是否 NVLink 可达决定：
-   - NVLink：直接通过 GPU P2P 写远端显存。
-   - RDMA：构造 RDMA SEND/WRITE，经 NIC 发送到远端。
+3. 无论目标是否本地 / NVLink 可达，DeepEP 侧的 `put` 一律走 GIN 路径（handle.cuh 注释："local or NVlink put will also go through NIC via this API"）；NCCL 内部对本地 / NVLink 目标的实际处理不在此展开。
 4. `remote_action` 可在 PUT 完成后触发远端原子操作或信号（用于 barrier / notify）。
 5. `extra_options` 常使用 `ncclGinOptFlagsAggregateRequests` 聚合多个小请求，降低 doorbell ringing。
 
@@ -312,9 +315,9 @@ std::pair<int, ncclGinResourceSharingMode> get_qp_mode(
 
 三种情况：
 
-1. **`num_qps == 1`**：所有 channel 共享 QP 0，sharing mode 为 grid-level。
+1. **`num_qps == 1`**：所有 channel 共享 QP 0，sharing mode 为 GPU 级（单 SM 时为 CTA 级：`kSharingGrid = (kNumSMs == 1) ? SHARING_CTA : SHARING_GPU`）。
 2. **notify warp**：固定使用 QP 0 + `NCCL_GIN_RESOURCE_SHARING_CTA`。
-3. **数据 channel**：
+3. **数据 channel**：有 notify warp 时数据 QP 从 QP 1 起（`kQPStartIdx = kWithNotifyWarps`），可用数为 `num_available_qps = num_qps - kQPStartIdx`：
    - 若 `num_sms <= num_available_qps`：每个 SM 独占若干 QP，channel 在 SM 内轮询。
    - 否则：所有 SM 共享所有 QP，按全局 channel 索引取模。
 
@@ -361,44 +364,63 @@ void nvlink_barrier_wo_local_sync(...) {
 ```cpp
 template <int kNumRanks, int kNumSMs, int kNumThreads, int kNumQPs>
 void gin_barrier_wo_local_sync(...) {
-    // 1. 所有 warp  flush 所有 QP
-    // 2. grid sync
-    // 3. SM0 用 QP0 对所有 peer 发 signal
-    // 4. SM0 等待所有 peer 的 signal 到达目标值
+    // 1. 所有 warp flush 所有 QP
+    // 2. World team：ptx::fence_acq_rel_sys()（world barrier 可能混用 NVLink 直写与 GIN signal，需 system-scope fence）
+    // 3. grid sync
+    // 4. SM0 用 QP0 对所有 peer 发 signal
+    // 5. SM0 等待所有 peer 的 signal 到达目标值
 }
 ```
 
 - 必须先 flush 所有 QP，确保之前的 PUT/GET 已经发布到网络。
+- flush 之后、grid sync 之前，World team 还需 `ptx::fence_acq_rel_sys()`（comm.cuh:149-155）。
 - 仅 SM0 执行 signal / wait，其他 SM 通过 grid sync 等待。
+- 等待的实现：每个线程把本地 shadow counter 自增得到 target，然后直接读 GDAKI 内部 `signals_table.buffer` 自旋等待（comm.cuh:166-185；TODO：待 NCCL 提供官方 wait-signal API 后替换）。
 
 ### 7.3 Hybrid barrier
 
 多节点 hybrid 模式下，同时存在 scale-up 与 scale-out 两个子域：
 
 ```cpp
+template <bool kFlushStores = true, bool kSyncAtStart = true, bool kSyncAtEnd = true>
 void gpu_barrier(...) {
+    // 0. kFlushStores：tma_store_commit / tma_store_wait / __syncwarp，防止 proxy 内存问题
+    // 1. kSyncAtStart：起始 grid sync（不开起始 sync 时，静态断言要求没有 store 可 flush）
+    if (kSyncAtStart) grid_sync();
+
+    do_scaleout &= kNumScaleoutRanks > 1;
+    do_scaleup &= kNumScaleupRanks > 1;
     if (do_scaleup and do_scaleout) {
+        assert(kNumSMs >= 2);                    // hybrid barrier 至少 2 个 SM
         if (sm_idx == 0) {
-            scaleup_barrier_wo_local_sync(...);   // NVLink barrier
-            grid_sync();
+            scaleup_barrier_wo_local_sync(...);  // scale-up barrier（NVLink 或 Gin World-team）
+            if (kFlushStores) grid_sync();       // scaleout 分支 flush 后自带一次 sync，需再对齐
         } else {
-            scaleout_barrier_wo_local_sync(...);  // Gin barrier
+            // 其余 SM 做 scale-out barrier，SM 数与索引整体左移一位
+            scaleout_barrier_wo_local_sync(..., kNumSMs - 1, ..., sm_idx - 1);
         }
+    } else if (do_scaleup) {
+        scaleup_barrier_wo_local_sync(...);      // 仅 scale-up：所有 SM
+    } else if (do_scaleout) {
+        scaleout_barrier_wo_local_sync(...);     // 仅 scale-out：所有 SM
     }
-    grid_sync();
+
+    // 2. kSyncAtEnd：收尾 grid sync
+    if (kSyncAtEnd) grid_sync();
 }
 ```
 
-- SM0 负责 scale-up（NVLink）barrier。
-- 其余 SM 负责 scale-out（RDMA）barrier。
-- 通过 grid sync 合并两个子域的完成状态。
+- SM0 负责 scale-up barrier，其余 SM 负责 scale-out（RDMA）barrier；scaleout 分支以 `kNumSMs - 1` / `sm_idx - 1` 重新索引，且 SM0 在 `kFlushStores` 时会额外多做一次 grid sync（comm.cuh:242-256）。
+- scale-up 子域并不总是 NVLink barrier：`scaleup_barrier_wo_local_sync` 按模板参数 `kIsScaleupNVLink` 二选一——NVLink 时走共享内存计数器的 NVLink barrier，否则走 Gin World-team barrier。多节点且 `allow_hybrid_mode=0` 时 scale-up 域跨节点，`is_scaleup_nvlink = (num_scaleup_ranks == num_nvl_ranks)` 为 false，此时走 Gin（nccl.cu:125，comm.cuh:189-202）。
+- 两个子域的完成状态通过 grid sync 合并。
+- 启动形态：QP 数可传约定值 `kFlushAllAllocatedQPs = -1` 表示 flush 所有已分配 QP；barrier kernel 固定 512 线程，非 sequential 且 scale-out 域大于 1 时用 2 个 SM，否则 1 个（sequential 模式串行执行 scale-out / scale-up，单 SM 即可）（barrier.hpp:65-80）。
 
 ```mermaid
 flowchart TB
     A["gpu_barrier 入口"] --> B{"scale-up + scale-out?"}
-    B -- 是 --> C["SM0: NVLink barrier"]
+    B -- 是 --> C["SM0: scale-up barrier (NVLink 或 Gin World)"]
     B -- 是 --> D["SM1+: Gin barrier"]
-    B -- 仅 scale-up --> E["所有 SM: NVLink barrier"]
+    B -- 仅 scale-up --> E["所有 SM: scale-up barrier (NVLink 或 Gin World)"]
     B -- 仅 scale-out --> F["所有 SM: Gin barrier"]
     C --> G["grid sync"]
     D --> G
@@ -488,7 +510,8 @@ void batched_write_and_wait(CUstream stream,
 
 - QP 太少：无法充分利用 NIC 并行性，成为瓶颈。
 - QP 太多：doorbell 开销、NIC cache 压力、连接状态内存增加。
-- 解析式公式在 direct 模式取 `min(num_sms, 8) + 1`，hybrid 模式取 `num_sms * 16 + 1`，并受 `num_allocated_qps` 上限约束。
+- 解析式公式在 direct 模式取 `min(num_sms, 8 + 1)` 即 `min(num_sms, 9)`（elastic.py:847；注意不是 `min(num_sms, 8) + 1`——当 `num_sms <= 8` 时后者会多 1，代码把 notify QP 也一并计入 min 的上限），hybrid 模式取 `num_sms * 16 + 1`，并受 `num_allocated_qps` 上限约束（`min(num_qps, num_allocated_qps)`）。
+- QP 自动分配默认值：`num_allocated_qps == 0` 时，hybrid 模式取 65（NIC 支持 fast RDMA atomic，即 MT4131）/ 129（否则），非 hybrid 取 17（elastic.py:328-335）。
 
 ---
 
@@ -511,8 +534,12 @@ DeepEP 所有通信 kernel 通过 JIT 在运行时编译，这给传输层带来
 |---|---|
 | `EP_NIC_NAME` | 默认 `mlx5_0`，用于 `ibstat` 查询 NIC 属性。 |
 | `EP_OVERRIDE_RDMA_SL` | 覆盖 RDMA service level。 |
-| `EP_DISABLE_GIN` | 禁用 NCCL Gin，回退到非 Gin 路径。 |
+| `EP_DISABLE_GIN` | 置非零时仅跳过 GIN requirements 的设置，即不创建 GIN context（nccl.cu:86-99）；代码中不存在“非 Gin 回退路径”，多 rank 下禁用后依赖 GIN 的 kernel 无法工作。 |
 | `EP_BUFFER_DEBUG` | 打印 QP 数量、SM 估算、barrier 调试信息。 |
+| `NCCL_WIN_STRIDE` | CPU buffer 过大、注册字节数超过显存容量时，Python 侧按 4 GiB 对齐设置的窗口 stride（elastic.py:285-298）。 |
+| `NCCL_SYM_REUSE_SYSMEM_HANDLES` | `NCCL_GIN_CROSS_NIC==0`（multi-plane）时设为 1，各 rank 共享 CPU segment、跳过 sysmem handle 的 proxy re-export（elastic.py:279-282）。 |
+| `EP_NUM_MAX_LOCAL_RANKS` | Hybrid 模式下 CPU 段重复映射的最大本地 rank 数，默认 16（elastic.py:288）。 |
+| `NCCL_ELASTIC_BUFFER_REGISTER` | 使用 Elastic 系列 CPU-backed 分配器时由 C++ 侧置 1，启用 NCCL elastic buffer 注册（symmetric.hpp:313-315）。 |
 
 ### 10.2 自动带宽检测
 
@@ -620,8 +647,8 @@ DeepEP 的传输层不是对 NCCL 的简单封装，而是在 NCCL Gin、CUDA Dr
     A[\"一个 warp = 一个 channel\"] --> B{\"是 notify warp?\"}
     B -- 是 --> C[\"QP 0 + SHARING_CTA\"]
     B -- 否 --> D{\"num_qps == 1?\"}
-    D -- 是 --> E[\"QP 0 + SHARING_GPU\"]
-    D -- 否 --> F{\"num_sms <= num_qps?\"}
+    D -- 是 --> E[\"QP 0 + SHARING_GPU (单 SM 时 CTA)\"]
+    D -- 否 --> F{\"num_sms <= num_available_qps?\"}
     F -- 是 --> G[\"每个 SM 独占若干 QP\"]
     F -- 否 --> H[\"所有 SM 共享 QP, 全局取模\"]"
 ```
@@ -631,9 +658,9 @@ DeepEP 的传输层不是对 NCCL 的简单封装，而是在 NCCL Gin、CUDA Dr
 ```text
 "flowchart TB
     A[\"gpu_barrier 入口\"] --> B{\"scale-up + scale-out?\"}
-    B -- 是 --> C[\"SM0: NVLink barrier\"]
+    B -- 是 --> C[\"SM0: scale-up barrier (NVLink 或 Gin World)\"]
     B -- 是 --> D[\"SM1+: Gin barrier\"]
-    B -- 仅 scale-up --> E[\"所有 SM: NVLink barrier\"]
+    B -- 仅 scale-up --> E[\"所有 SM: scale-up barrier (NVLink 或 Gin World)\"]
     B -- 仅 scale-out --> F[\"所有 SM: Gin barrier\"]
     C --> G[\"grid sync\"]
     D --> G
