@@ -145,6 +145,12 @@ __forceinline__ __device__ void gin_barrier_wo_local_sync(
         for (int i = global_warp_idx; i < num_qps; i += kNumSMs * kNumWarps) {
             ncclGin(nccl_dev_comm, i, NCCL_GIN_RESOURCE_SHARING_CTA).flush(ncclCoopWarp());
         }
+
+        // World-team barriers may mix direct NVLink writes with GIN signals, so a system-scope
+        // threadfence is required to make the NVLink writes visible before publishing the barrier
+        if constexpr (std::is_same_v<team_t, ncclTeamTagWorld>)
+            ptx::fence_acq_rel_sys();
+
         // NOTES: we can not use `kNumSMs` to judge, as maybe only part of the SMs will call this function
         (gridDim.x > 1) ? cooperative_groups::this_grid().sync() : __syncthreads();
     }
