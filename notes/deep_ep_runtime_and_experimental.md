@@ -43,17 +43,20 @@ Legacy V1 的部分 kernel 仍在 `setup.py` 的 `CUDAExtension` 里预编译；
 
 ```text
 Python import deep_ep
-    └─ init_jit() → C++ jit::api::init(library_root, cuda_home, nccl_root)
-         ├─ IncludeParser::prepare_init   # deep_ep/include 根路径
+    └─ init_jit() → C++ deep_ep::jit::init(library_root, cuda_home, nccl_root)
+         # 位于 csrc/jit/api.hpp（pybind 注册名 init_jit，无 jit::api 子命名空间）
+         ├─ Compiler::prepare_init        # 头文件、NCCL include 等
          ├─ KernelRuntime::prepare_init   # cuobjdump 所在 CUDA home
-         └─ Compiler::prepare_init        # 头文件、NCCL include 等
+         └─ IncludeParser::prepare_init   # deep_ep/include 根路径
 
 首次 launch_xxx(...)
     ├─ XxxRuntime::generate(args)         # LaunchRuntime CRTP：拼出 kernel.cu 源码
     │     └─ 在源码头注入 “Includes' hash value”
     ├─ compiler->build(name, code)        # 查内存缓存 → 磁盘缓存 → NVCC 编译
-    └─ XxxRuntime::launch(runtime, args)  # cuLaunchKernel + 可选 PDL / cooperative
+    └─ XxxRuntime::launch(runtime, args)  # cuLaunchKernelEx + 可选 PDL / cooperative
 ```
+
+launch API 说明：默认（driver API）路径用 `cuLaunchKernelEx`（`csrc/jit/handle.hpp:161`）；当 `CUDART_VERSION >= 12080` 且定义了 `EP_JIT_USE_RUNTIME_API` 时改走 `cudaLaunchKernelExC`（handle.hpp:22、80），该路径下 cooperative launch 与 PDL（dependent kernel launch）尚未实现（handle.hpp:65 的 TODO）。
 
 核心文件：
 
@@ -167,9 +170,11 @@ flowchart TD
 `ElasticBuffer` 内部持有独立的 **`comm_stream`**（通信流），用户当前流视为 **compute stream**。
 
 ```text
-compute stream:  GEMM / Attention / gate ...
-comm stream:     dispatch / combine / barrier / engram / pp / agrs ...
+compute stream:  GEMM / Attention / gate ... / engram_fetch(+wait) / pp_send / pp_recv
+comm stream:     dispatch / combine / all_gather(AGRS) / barrier（默认 use_comm_stream=True）
 ```
+
+流归属以实际 launch 调用为准：engram_fetch / engram_fetch_wait 与 pp_send / pp_recv 全部在用户当前流（compute stream）上 launch——`csrc/elastic/buffer.hpp:308/321`（engram）、`354/373`（pp），均传 `at::cuda::getCurrentCUDAStream()`。走 comm stream 的只有 dispatch（`buffer.hpp:1003/1146`）、combine（`1303/1329`）、all_gather（`489/491/506/517`）；barrier 默认 `use_comm_stream=True` 走 comm stream（`deep_ep/buffers/elastic.py:497`），其 `sequential=True`（默认）还会把 scaleout/scaleup 两级 barrier 串行到单个 SM 上执行，同步保证更强，主要用于测试同步。
 
 同步边界由 `EventHandle` / `EventOverlap` 表达，而不是隐式 `cudaDeviceSynchronize`。
 
@@ -235,6 +240,8 @@ event.register_hook_after_wait(lambda: handle.deterministic_sort(...))
 
 `release_handle=True` 可在 wait 后丢掉底层 `EventHandle`，释放其持有的 tensor 引用（多流 wait 时需用户自行管理）。
 
+deterministic 模式：构造 `ElasticBuffer` 时传 `deterministic=True`，dispatch 完成后由 `ElasticBuffer.dispatch` 在 **Python 端**调用 `EPHandle.deterministic_sort` 重排接收 token（`deep_ep/buffers/elastic.py:100-193`，调用点 `elastic.py:1019-1027`）：按 `src_token_global_idx` 排序，非 expand 模式重排 `recv_x`/`recv_sf`/`recv_topk_idx`/`recv_topk_weights`/`recv_src_metadata`；expand 模式仅在各 expert 分组内部重排，并相应更新 `recv_src_metadata` 中的 slot 指针（其本身不再置换）。`async_with_compute_stream=True` 时该重排经 `register_hook_after_wait` 挂在 event wait 之后，否则同步立即执行。
+
 ### 3.4 PDL 与双 kernel 切分
 
 Dispatch / combine 故意拆成 **main + epilogue** 两个 JIT kernel：
@@ -244,9 +251,11 @@ Dispatch / combine 故意拆成 **main + epilogue** 两个 JIT kernel：
 | `dispatch_impl` / `hybrid_dispatch_impl` | `dispatch_copy_epilogue` | main 完成 notify + 数据搬入 symmetric buffer；epilogue 再 copy 到用户 `recv_x`、处理 expand/padding |
 | `combine_impl` / `hybrid_combine_impl` | `combine_reduce_epilogue` | main 完成反向搬运与 partial reduce；epilogue 做最终加权/规约到 `combined_x` |
 
+combine 还接受 `bias` 参数——0/1/2 个 `[num_combined_tokens, hidden]` 的 BF16 张量，Python 侧解包为 `bias_0`/`bias_1` 传给 reduce epilogue（`deep_ep/buffers/elastic.py:1038-1044`）。
+
 好处：
 
-1. Main 末尾 `cudaTriggerProgrammaticLaunchCompletion()` 后，**无需 CPU 再 launch 一轮**即可启动 epilogue（PDL）。
+1. Main/epilogue 通过 PDL 衔接：`cudaTriggerProgrammaticLaunchCompletion()` 仅出现在 dispatch 侧 main kernel 末尾（`impls/dispatch.cuh:403`、`impls/hybrid_dispatch.cuh:668`）；combine/hybrid_combine 的 main kernel 无显式触发，其 epilogue 依赖靠 epilogue 侧 launch 属性（`pdl_enabled=true`，`csrc/kernels/elastic/combine.hpp:282`）加 epilogue 开头的 `cudaGridDependencySynchronize()`（`impls/combine_reduce_epilogue.cuh:59`）衔接。注意 PDL 免除的是 GPU 上“等 main kernel 完成”的串行化等待，CPU 仍会照常 enqueue epilogue kernel。
 2. Epilogue 的 SM 占用、寄存器压力与通信主循环解耦。
 3. 中间 buffer 布局可在 main 内用原子/前缀和写好，epilogue 只做规则内存搬运。
 
@@ -262,6 +271,10 @@ PDL 相关细节亦见 `deep_ep_explained.md` 第 4/5 章；本文强调的是�
 | 调试正确性 | 先关 async，确认数值，再打开重叠 |
 
 `prefer_overlap_with_compute=True`（默认）还会影响 `get_theoretical_num_sms`：倾向 **更少 SM**，把 SM 留给计算；设为 `False` 时可能抬高到 64 SM 以追带宽峰值。
+
+QP 数不需要手工指定：`get_theoretical_num_qps(num_sms)` 自动估算（`elastic.py:836-853`）——direct 模式 `min(num_sms, 9)`（少 QP 以降低 DB ringing 开销），hybrid 模式 `num_sms * 16 + 1`（每个 channel 及 notify warp 各占一个 QP），最后夹到构造时分配的 `num_allocated_qps` 上限（hybrid 默认 65、支持 fast RDMA atomic 时 129；direct 默认 17，`elastic.py:328-335`）。
+
+dispatch / engram_fetch 的 `use_tma_aligned_col_major_sf`（默认 `False`）控制 FP8 scale factor 是否转成 TMA 对齐的 column-major 布局（`elastic.py:873/915`、`585/594`）。
 
 ---
 
@@ -298,9 +311,11 @@ PDL 相关细节亦见 `deep_ep_explained.md` 第 4/5 章；本文强调的是�
 4. `cudaMemcpyAsync` DeviceToDevice 写入 CPU 映射段（统一 VA，底层是 host memory）。
 5. 再 `barrier`，保证全集群可见。
 
-容量提示：`ElasticBuffer.get_engram_storage_size_hint(num_entries, hidden, ...)` → 对齐后的 `num_cpu_bytes`。
+容量提示：`ElasticBuffer.get_engram_storage_size_hint(num_entries, hidden, num_max_tokens_per_rank, dtype=torch.bfloat16)` 返回二元组 `(num_gpu_bytes, num_cpu_bytes)`（均 2 MB 对齐）：`num_gpu_bytes` 为 fetch 接收区预留（按 `num_max_tokens_per_rank`），`num_cpu_bytes` 为本地 storage 预留（按 `num_entries`）；第 3 个位置参数 `num_max_tokens_per_rank` 必填（`deep_ep/buffers/elastic.py:408-435`，真实用法见 `tests/elastic/test_engram.py:17-18`）。
 
 FP8 模式下，`sf` 表全局复制到各 rank GPU（fetch 时本地 gather scale，避免再 RDMA 拉 scale）。
+
+大 CPU buffer 相关环境变量由构造函数自动处理（`elastic.py:279-298`）：`num_cpu_bytes > 0` 且注册字节数（GPU 段 + CPU 段 × `EP_NUM_MAX_LOCAL_RANKS`，默认 16，仅 hybrid 模式计入，另加 4 GiB workspace 余量）超过单卡显存时，自动设置 `NCCL_WIN_STRIDE`（按 4 GiB 对齐）扩大 NCCL VA 空间；`NCCL_GIN_CROSS_NIC=0` 时自动 `setdefault NCCL_SYM_REUSE_SYSMEM_HANDLES=1`（多平面下各 rank 共享 CPU 段，跳过 sysmem handle 的 proxy re-export）。
 
 ### 4.3 `engram_fetch` 设备端流程
 
@@ -335,11 +350,12 @@ flowchart TD
 ### 4.5 API 小结
 
 ```python
-num_cpu = ElasticBuffer.get_engram_storage_size_hint(num_entries, hidden, ...)
-buf = ElasticBuffer(group, num_bytes=..., num_cpu_bytes=num_cpu, ...)
+num_gpu, num_cpu = ElasticBuffer.get_engram_storage_size_hint(   # → (num_gpu_bytes, num_cpu_bytes)
+    num_entries, hidden, num_max_tokens_per_rank)                # 第 3 个位置参数必填
+buf = ElasticBuffer(group, num_bytes=num_gpu + num_cpu, num_cpu_bytes=num_cpu, ...)
 
 buf.engram_write(storage)                      # [E, H] → CPU segment
-hook = buf.engram_fetch(indices, num_qps=...)  # indices: 全局 entry id
+hook = buf.engram_fetch(indices, num_qps=..., use_tma_aligned_col_major_sf=False)
 data, sf = hook()                              # wait 后取回 GPU tensor
 ```
 
@@ -406,7 +422,7 @@ README 写 0-SM PP（RDMA）。当前树中的 PP 实现 **仍占用少量 SM** 
 
 ### 5.5 容量
 
-`get_pp_buffer_size_hint(num_max_tensor_bytes, num_max_inflight_tensors, ...)` 估算 GPU buffer 需求：双向 × inflight × max tensor（另加 workspace 信号区）。
+`get_pp_buffer_size_hint(num_max_tensor_bytes, num_max_inflight_tensors)` 返回 `align(num_max_tensor_bytes × num_max_inflight_tensors × 2 × 2, 2 MB)`（`elastic.py:438-456`）：一个 ×2 是 send/recv 双向各一份，另一个 ×2 是环上 prev/next 两个邻居各一套，合计 ×4。注意该 hint **不含 workspace**——workspace 由 `ElasticBuffer` 构造函数按 `WorkspaceLayout::get_num_bytes()` 对齐到 2 MB 后另行叠加到对称段头部（`csrc/elastic/buffer.hpp:104-110`）；`pp_set_config` 也按同样的 ×4 公式 assert buffer 容量（`buffer.hpp:332`）。
 
 ---
 
@@ -414,7 +430,7 @@ README 写 0-SM PP（RDMA）。当前树中的 PP 实现 **仍占用少量 SM** 
 
 ### 6.1 定位
 
-**AGRS**（All-Gather / Reduce-Scatter）面向上下文并行（CP）或需要 **NVLink 域内** 大块对称 gather 的场景。V2 当前实现重点是 **session 内 all-gather**；session 生命周期为 reduce-scatter 类算子预留了信号与缓冲槽位。
+**AGRS**（All-Gather / Reduce-Scatter）面向上下文并行（CP）或需要 **NVLink 域内** 大块对称 gather 的场景。V2 当前实现重点是 **session 内 all-gather**。workspace 中 AGRS 信号区大小为 `(kNumMaxInflightAGRS + 1) × kNumMaxRanks × sizeof(int)`（`common/layout.cuh:77`；`kNumMaxInflightAGRS = 32`，`layout.cuh:22`）；reduce-scatter 本身尚未实现，与 README 标注的 "on-going" 状态一致。
 
 特点：
 
